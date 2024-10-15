@@ -151,6 +151,9 @@ dmypy.json
 # pytype static type analyzer
 .pytype/
 
+# the bane
+.DS_Store
+
 # Cython debug symbols
 cython_debug/
 
