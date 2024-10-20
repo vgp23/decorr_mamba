@@ -154,6 +154,10 @@ dmypy.json
 # the bane
 .DS_Store
 
+/src/gpt2tokenizer
+
+
+
 # Cython debug symbols
 cython_debug/
 
