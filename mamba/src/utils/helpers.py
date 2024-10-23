@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from torch.utils.data import Dataset
-from typing import Callable
 import math
+from typing import Callable, Union
 import numpy as np
 import matplotlib.pyplot as plt 
 import torch  
@@ -115,6 +115,7 @@ class MambaArgs:
     n_layers: int
     vocab_size: int = 50257 # GPT2 tokenizer default
     assert vocab_size <= 50257, "Vocab size exceeds maximum of GPT2 tokenier"
+    pad_vocab_size_multiple: int = 8
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     expansion_factor: int = 2 # input embeddings are upscaled by this factor
     conv_1d_size: int = 4
@@ -125,7 +126,7 @@ class MambaArgs:
     # relevant projection weights
     delta_init: str = "random" # other option is "constant"
     delta_scale: float = 1.0
-    delta_rank = "auto"
+    delta_rank: Union[int, str] = 'auto'
 
     # for the biases to the delta projection layer
     delta_min = 0.001
@@ -136,7 +137,12 @@ class MambaArgs:
         # see discussion in paper about dimensionality of delta
         self.D_inner = int(self.expansion_factor * self.D)
         if self.delta_rank == "auto":
-            self.delta_rank = math.ceil(self.N/16)
+            self.delta_rank = math.ceil(self.D/16)
+
+        # padding vocab size to be a nice number for parallel processing
+        if self.vocab_size % self.pad_vocab_size_multiple != 0:
+            self.vocab_size += (self.pad_vocab_size_multiple
+                                - self.vocab_size % self.pad_vocab_size_multiple)
 
 class SeqDataset(Dataset):
     ''' A simple way of creating datasets for next token prediction training
@@ -151,7 +157,7 @@ class SeqDataset(Dataset):
             device (device)
             seq_size (int)
             seqs (list[str])
-            
+
         '''
 
         
@@ -215,13 +221,9 @@ class LanguageDatasetMaker:
         self.mamba_args = mamba_args
         self.train_args = train_args
 
-        tokenizer_path = os.path.join(".", "gpt2tokenizer")
-        if os.path.exists(tokenizer_path) and os.path.isdir(tokenizer_path):
-            self.tokenizer = GPT2Tokenizer.from_pretrained(tokenizer_path)
-        else:
-            self.tokenizer = GPT2Tokenizer.from_pretrained("openai-community/gpt2", 
-                                                            force_download=True)
-            self.tokenizer.save_pretrained(tokenizer_path)
+
+        self.tokenizer = GPT2Tokenizer.from_pretrained("openai-community/gpt2")
+
 
         self.train_split = train_split
         self.val_split = val_split
@@ -260,14 +262,14 @@ class LanguageDatasetMaker:
         # with unk token 
         filtered_ids = []
         unk_id = self.tokenizer.get_vocab()['unk']
-        for token_id in token_ids:
-            # if given vocab size is not large enough to include the unk token itself, 
-            # the vocab size must be reduced by 1 to fit this in
-            if unk_id > self.mamba_args.vocab_size-1:
-                vocab_limit = self.mamba_args.vocab_size-2
-            else:
-                vocab_limit = self.mamba_args.vocab_size-1
+        # if given vocab size is not large enough to include the unk token itself, 
+        # the vocab size must be reduced by 1 to fit this in
+        if unk_id > self.mamba_args.vocab_size-1:
+            vocab_limit = self.mamba_args.vocab_size-2
+        else:
+            vocab_limit = self.mamba_args.vocab_size-1
 
+        for token_id in token_ids:
             # filter the text to only include top n most common words
             if token_id > vocab_limit and token_id != unk_id:
                 filtered_ids.append(unk_id)

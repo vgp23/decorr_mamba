@@ -156,6 +156,7 @@ dmypy.json
 
 mamba/src/gpt2tokenizer/
 mamba/src/checkpoints
+reference/
 
 
 

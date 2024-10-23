@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from utils.helpers import MambaArgs
 import math
 from functools import partial
+import json
 
 
 class Mamba(nn.Module):
@@ -18,7 +19,7 @@ class Mamba(nn.Module):
 
         self.layers = nn.ModuleList([ResidualMambaBlock(args) 
                                      for _ in range(args.n_layers)])
-        self.norm_f = RMSNorm(args.D)
+        self.rms = RMSNorm(args.D)
 
         self.logits = nn.Linear(args.D, args.vocab_size, bias=False)
         self.logits.weight = self.embedding.weight # weight tying! 
@@ -49,6 +50,67 @@ class Mamba(nn.Module):
 
         self.apply(partial(_init_weights))
 
+    # https://github.com/johnma2006/mamba-minimal/blob/master/model.py 
+    @staticmethod
+    def from_pretrained(pretrained_model_name: str):
+        """Load pretrained weights from HuggingFace into model.
+    
+        Args:
+            pretrained_model_name: One of
+                * 'state-spaces/mamba-2.8b-slimpj'
+                * 'state-spaces/mamba-2.8b'
+                * 'state-spaces/mamba-1.4b'
+                * 'state-spaces/mamba-790m'
+                * 'state-spaces/mamba-370m'
+                * 'state-spaces/mamba-130m'
+                            
+        Returns:
+            model: Mamba model with weights loaded
+    
+        """
+        from transformers.utils import WEIGHTS_NAME, CONFIG_NAME
+        from transformers.utils.hub import cached_file
+        
+        def load_config_hf(model_name):
+            resolved_archive_file = cached_file(model_name, CONFIG_NAME,
+                                                _raise_exceptions_for_missing_entries=False)
+            return json.load(open(resolved_archive_file))
+        
+        
+        def load_state_dict_hf(model_name, device=None, dtype=None):
+            resolved_archive_file = cached_file(model_name, WEIGHTS_NAME,
+                                                _raise_exceptions_for_missing_entries=False)
+            return torch.load(resolved_archive_file, weights_only=True, map_location='cpu', mmap=True)
+        
+        config_data = load_config_hf(pretrained_model_name)
+        args = MambaArgs(
+            D=config_data['d_model'],
+            n_layers=config_data['n_layer'],
+            vocab_size=config_data['vocab_size'],
+            N=16
+        )
+        model = Mamba(args)
+        
+        state_dict = load_state_dict_hf(pretrained_model_name)
+
+        # define a new dictionary to make the names match
+        new_state_dict = {}
+        for key in state_dict:
+            new_key = key.replace('backbone.', '')
+            new_key = new_key.replace('mixer', 'block')
+            new_key = new_key.replace('D', 's6_block.D')
+            new_key = new_key.replace('A_log', 's6_block.log_minus_A')
+            new_key = new_key.replace('norm_f', 'rms')
+            new_key = new_key.replace('norm', 'rms')
+            new_key = new_key.replace('dt_proj', 's6_block.delta_upscale')
+            new_key = new_key.replace('x_proj', 's6_block.to_BCdelta')    
+            new_key = new_key.replace('lm_head', 'logits')    
+            new_state_dict[new_key] = state_dict[key]
+        
+        model.load_state_dict(new_state_dict)
+
+        return model
+
 
     def forward(self, x):
 
@@ -57,7 +119,7 @@ class Mamba(nn.Module):
         for layer in self.layers:
             x = layer(x)
             
-        x = self.norm_f(x)
+        x = self.rms(x)
         logits = self.logits(x)
 
         return logits
@@ -179,17 +241,26 @@ class S6Block(nn.Module):
         self.D._no_weight_decay = True
         
         
-    def discretize(self, delta, B):
+    def discretize(self, delta, B, x):
 
-        # ZOH discretization. Official implementation approximates B_bar with
-        # Euler step instead
-        delta_A = torch.einsum('bld,dn->bldn', delta, -torch.exp(self.log_minus_A))
+        # ZOH discretization. NB that the log space A is being cast back into
+        # A here, as the equation in the paper requires
+        delta_A = torch.einsum('bld, dn -> bldn', delta, -torch.exp(self.log_minus_A))
         A_bar = torch.exp(delta_A)
-        delta_B = torch.einsum('bld,bln->bldn', delta, B)
-        # diagonal matrices, so 1/A is the inverse, subtracting 1 instead 
-        # of the identity matrix, and directly multiplying elementwise for the 
-        # first multiplication (second is defined elementwise anyway)
-        B_bar = 1/(delta_A) * (A_bar - 1) * delta_B
+
+        # below is the full ZOH discretization of B according to the paper.
+        # the official implementation doesn't actually do this, instead using 
+        # an Euler discretization, as it's cheaper to compute with minimal
+        # performance cost. Not sure what we should do for our implementation...
+
+        # delta_B = torch.einsum('bld,bln->bldn', delta, B)
+        # # diagonal matrices, so 1/A is the inverse, subtracting 1 instead 
+        # # of the identity matrix, and directly multiplying elementwise for the 
+        # # first multiplication (second is defined elementwise anyway)
+        # B_bar = 1/(delta_A) * (A_bar - 1) * delta_B
+
+        # Euler discretization
+        B_bar = torch.einsum('bld, bln, bld -> bldn', delta, B, x)
 
         return A_bar, B_bar
 
@@ -206,7 +277,7 @@ class S6Block(nn.Module):
         delta = F.softplus(delta)
 
         # discretization
-        A_bar, B_bar = self.discretize(delta, B) # (B, L, D, N)
+        A_bar, B_bar = self.discretize(delta, B, x) # (B, L, D, N)
         
         # input transformation is parallelizable
         input_transform = B_bar * x.unsqueeze(-1) # (B, L, D, N)
@@ -223,7 +294,7 @@ class S6Block(nn.Module):
                 input_transform[:,i,:,:] # (B,D,N)
         
         # compute outputs in parallel
-        outputs = torch.einsum('bln,bldn->bld', C, hidden_states[:,1:,:,:])
+        outputs = torch.einsum('bln, bldn -> bld', C, hidden_states[:,1:,:,:])
 
         # throw in D as residual connections with no bias
         outputs = outputs + x * self.D
@@ -245,6 +316,3 @@ class RMSNorm(nn.Module):
         output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
         return output
-
-if __name__ == "__main__":
-    mamba_args = MambaArgs(15, 20, 10, device="mps")
