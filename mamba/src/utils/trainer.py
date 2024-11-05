@@ -69,9 +69,7 @@ class MambaTrainer:
 			val_loader (DataLoader): PyTorch-compatible validation dataloader
 
 		'''
-
-		# TODO: implement checkpoint saving functionality
-
+		
 		criterion = nn.CrossEntropyLoss()
 
 		# used in language modelling, usually

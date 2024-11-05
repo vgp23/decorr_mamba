@@ -160,7 +160,7 @@ class MambaBlock(nn.Module):
         self.out_proj = nn.Linear(args.D_inner, args.D, bias=args.general_bias)
 
     def forward(self, x):
-        b, l, _ = x.shape # used to avoid specifying these in 
+        b, l, _ = x.shape # used to avoid specifying these in the model args
 
         x = self.in_proj(x)
         # split the input into the two paths
