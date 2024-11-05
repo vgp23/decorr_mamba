@@ -5,7 +5,7 @@ from typing import Callable, Union
 import numpy as np
 import matplotlib.pyplot as plt 
 import torch  
-from transformers import GPT2Tokenizer
+from transformers import AutoTokenizer
 import os
 
 
@@ -222,7 +222,7 @@ class LanguageDatasetMaker:
         self.train_args = train_args
 
 
-        self.tokenizer = GPT2Tokenizer.from_pretrained("openai-community/gpt2")
+        self.tokenizer = AutoTokenizer.from_pretrained('EleutherAI/gpt-neox-20b')
 
 
         self.train_split = train_split

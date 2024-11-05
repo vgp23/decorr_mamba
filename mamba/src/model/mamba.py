@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# from einops import rearrange, repeat # might be useful later
+# from einops import rearrange, repeat, einsum # might be useful later
 from utils.helpers import MambaArgs
 import math
 from functools import partial
@@ -160,7 +160,8 @@ class MambaBlock(nn.Module):
         self.out_proj = nn.Linear(args.D_inner, args.D, bias=args.general_bias)
 
     def forward(self, x):
-        b, l, _ = x.shape # used to avoid specifying these in args
+        b, l, _ = x.shape # used to avoid specifying these in 
+
         x = self.in_proj(x)
         # split the input into the two paths
         (x, res) = x.split(
@@ -245,7 +246,7 @@ class S6Block(nn.Module):
 
         # ZOH discretization. NB that the log space A is being cast back into
         # A here, as the equation in the paper requires
-        delta_A = torch.einsum('bld, dn -> bldn', delta, -torch.exp(self.log_minus_A))
+        delta_A = torch.einsum('bld, dn -> bldn', delta, -torch.exp(self.log_minus_A.float()))
         A_bar = torch.exp(delta_A)
 
         # below is the full ZOH discretization of B according to the paper.
@@ -259,28 +260,28 @@ class S6Block(nn.Module):
         # # first multiplication (second is defined elementwise anyway)
         # B_bar = 1/(delta_A) * (A_bar - 1) * delta_B
 
-        # Euler discretization
-        B_bar = torch.einsum('bld, bln, bld -> bldn', delta, B, x)
+        # Euler discretization. Computes the product with the input
+        # at this step, removes unnecessary computation later
+        B_bar_x = torch.einsum('bld, bln, bld -> bldn', delta, B, x)
 
-        return A_bar, B_bar
+        return A_bar, B_bar_x
 
     def forward(self, x):
         b, l, _ = x.shape 
         # generate all projected parameters and split them up
         BCdelta = self.to_BCdelta(x)
+
         # delta: (B, L, 1). B, C: (B, L, N)
-        (B, C, delta) = BCdelta.split(
-            split_size=[self.args.N, self.args.N, self.args.delta_rank], dim=-1)
+        (delta, B, C) = BCdelta.split(
+            split_size=[self.args.delta_rank, self.args.N, self.args.N], dim=-1)
 
         # "broadcasting" for delta and computing final parameters
         delta = self.delta_upscale(delta) # (B,L,D)
         delta = F.softplus(delta)
 
-        # discretization
-        A_bar, B_bar = self.discretize(delta, B, x) # (B, L, D, N)
-        
-        # input transformation is parallelizable
-        input_transform = B_bar * x.unsqueeze(-1) # (B, L, D, N)
+        # discretization. NB that the discretized version of B is 
+        # already applied to the input sequence here!
+        A_bar, B_bar_x = self.discretize(delta, B, x) # (B, L, D, N)
         
         # scan through each individual token to compute hidden states
         hidden_states = torch.zeros(
@@ -291,13 +292,13 @@ class S6Block(nn.Module):
             # equivalent to taking the elementwise product of the diagonal
             # and the hidden state
             hidden_states[:,i+1,:,:] = A_bar[:,i,:,:]*hidden_states[:,i,:,:].clone() + \
-                input_transform[:,i,:,:] # (B,D,N)
+                B_bar_x[:,i,:,:] # (B,D,N)
         
         # compute outputs in parallel
         outputs = torch.einsum('bln, bldn -> bld', C, hidden_states[:,1:,:,:])
 
         # throw in D as residual connections with no bias
-        outputs = outputs + x * self.D
+        outputs = outputs + x * self.D.float()
 
         return outputs
 
