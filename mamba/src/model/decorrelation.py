@@ -8,9 +8,16 @@ from functools import partial
 from copy import deepcopy
 
 class DecorrLoss(nn.Module):
-	''' 
-	Computes the gradients and losses associated with the decorrelation update
-	'''
+	"""
+	Computes the gradients and losses associated with the decorrelation update.
+
+	This module calculates two types of losses:
+	- **Correlation Loss**: Measures the sum of squared covariances between features.
+	- **Whitening Loss**: Measures the sum of squared variances deviating from identity.
+	
+	It also computes the gradient used to update the decorrelation matrices in decorrelation layers.
+
+	"""
 
 	def __init__(self):
 		super(DecorrLoss, self).__init__()
@@ -18,6 +25,47 @@ class DecorrLoss(nn.Module):
 
 	def forward(self, x, kappa: float, compute_grad: bool = True, 
 		compute_loss: bool = True):
+
+		"""
+		Computes the decorrelation gradient and/or losses for the given input tensor.
+
+		Args:
+			x (torch.Tensor): Input tensor of shape (B, L, D), where:
+				- B: Batch size.
+				- L: Sequence length.
+				- D: Feature dimension.
+			kappa (float): Regularization parameter for blending correlation and whitening 
+				losses. Must be between 0 and 1, where:
+				- `kappa = 0` emphasizes decorrelation.
+				- `kappa = 1` emphasizes whitening.
+			compute_grad (bool, optional): If `True`, computes the gradient for the 
+				decorrelation matrix. Defaults to `True`.
+			compute_loss (bool, optional): If `True`, computes the decorrelation 
+				losses (correlation and whitening). Defaults to `True`.
+
+		Returns:
+			Tuple[torch.Tensor or None, float or None, float or None]:
+				- **grad** (torch.Tensor or None): Gradient tensor of shape (D, D). 
+				  Returns `None` if `compute_grad` is `False`.
+				- **correlation_loss** (float or None): Correlation loss scalar. 
+				  Returns `None` if `compute_loss` is `False`.
+				- **whitening_loss** (float or None): Whitening loss scalar. 
+				  Returns `None` if `compute_loss` is `False`.
+
+		Raises:
+			AssertionError: If `kappa` is not specified or is not in the range [0, 1].
+			AssertionError: If both `compute_grad` and `compute_loss` are `False` 
+				(unexpected usage case).
+
+		Notes:
+			- The decorrelation gradient is calculated as a weighted combination of the 
+			  covariance matrix (`C`) and the variance deviation matrix (`V`):
+				`grad = mean((1-kappa)*C + kappa*V, dim=0)`
+			- The losses are calculated as:
+				- Correlation Loss: Mean of the squared covariances across batches.
+				- Whitening Loss: Mean of the squared deviations of variances from identity.
+
+		"""	
 
 		if not compute_grad and not compute_loss:
 			# shouldn't ever be reached during normal use, but here for
@@ -45,7 +93,7 @@ class DecorrLoss(nn.Module):
 				torch.mean(
 					torch.mean(C**2, dim=(1,2)))
 
- 			# sum of squared variances
+			# sum of squared variances
 			whitening_loss = \
 				torch.mean(
 					torch.mean(V**2, dim=(1,2)))
@@ -64,14 +112,60 @@ class DecorrLoss(nn.Module):
 	
 
 class DecorrLinear(nn.Module):
-	''' 
-	Prefaces original nn.Linear layers in a network
-	with a trainable matrix multiplication initialized
-	at identity.
-	'''
+	"""
+	A modified linear layer that prefaces the original `nn.Linear` layer 
+	with a trainable decorrelation matrix initialized at identity.
 
+	This layer adds decorrelation functionality to the standard linear operation, 
+	enabling the computation of decorrelation and whitening losses. Gradients for 
+	the decorrelation matrix are computed inside the forward pass.
+
+	Args:
+		original_layer (nn.Module): The original `nn.Linear` layer to augment with 
+			a decorrelation matrix.
+		**kwargs: Additional arguments for configuring the decorrelation behavior.
+			- `sample_frac` (float): Fraction of input samples to use for computing 
+			  decorrelation loss and gradients. Must be between 0 and 1.
+			- `kappa` (float): Hyperparameter used to compute decorrelation matrix gradients.
+
+	Attributes:
+		original_layer (nn.Module): The original linear layer being augmented.
+		decorr_layer (nn.Parameter): Trainable decorrelation matrix initialized at identity.
+		compute_grad (bool): Indicates whether decorrelation gradients are computed 
+			during the forward pass.
+		compute_loss (bool): Indicates whether decorrelation and whitening losses 
+			are computed during the forward pass.
+		sample_frac (float): Fraction of input samples to use for loss and gradient computation.
+		kappa (float): Hyperparameter used to compute decorrelation matrix gradients.
+		correlation_loss (float): Accumulated correlation loss across batches.
+		whitening_loss (float): Accumulated whitening loss across batches.
+		grad (torch.Tensor or None): Gradient of the decorrelation matrix, computed 
+			during the forward pass.
+		loss (DecorrLoss): Loss function instance for computing decorrelation and whitening losses.
+
+	Methods:		
+		reset():
+			Resets accumulated losses and gradients to their initial state.
+		
+		reset_grad():
+			Resets the gradient of the decorrelation matrix only.
+		
+		train(mode: bool = True):
+			Enables or disables training mode for the layer. Controls whether decorrelation 
+			gradients are computed.
+
+	"""
 	def __init__(self, original_layer: nn.Module, **kwargs):
+		"""
+		Initializes the DecorrLinear with a decorrelation matrix.
 
+		Args:
+			original_layer (nn.Module): The original linear layer to extend.
+			**kwargs: Additional arguments for decorrelation parameters, such as:
+				- `kappa` (float): Decorrelation gradient hyperparameter.
+				- `sample_frac` (float): Fraction of data sampled for decorrelation
+					gradient calculation.
+		"""
 		super(DecorrLinear, self).__init__()
 
 		self.original_layer = original_layer
@@ -155,14 +249,39 @@ class DecorrLinear(nn.Module):
 
 
 class DecorrConv1d(DecorrLinear):
-	''' 
-	Prefaces original nn.Conv1d layers in a network with a trainable matrix multiplication 
-	initialized at identity. Works in two modes, either decorrelating features of each 
-	token independently, or all of the features within each convolutional patch.
-	''' 
+	"""
+	Implements decorrelation for `nn.Conv1d` layers by prefacing them with a trainable 
+	decorrelation matrix initialized at identity.
+
+	The decorrelation matrix can operate in two modes:
+	- "token": Each token's features are decorrelated independently.
+	- "patch": Features across entire convolutional patches are decorrelated.
+
+	Attributes:
+		model_args (MambaArgs): Arguments for the Mamba model architecture.
+		mode (str): Mode of operation for decorrelation (`"token"` or `"patch"`).
+		decorr_layer (nn.Parameter): Trainable decorrelation matrix, initialized at identity.
+
+	"""
 	def __init__(self, original_layer: nn.Module, model_args: MambaArgs, mode: str = "patch", 
 		**kwargs):
+		"""
+		Initializes the DecorrConv1d layer with a decorrelation matrix.
 
+		Args:
+			original_layer (nn.Module): The original convolutional layer to extend.
+			model_args (MambaArgs): Arguments for the Mamba model architecture.
+			mode (str, default="patch"): Decorrelation mode. 
+				- `"token"`: Decorrelate features of each token independently.
+				- `"patch"`: Decorrelate features across convolutional patches.
+			**kwargs: Additional arguments for decorrelation parameters, such as:
+				- `kappa` (float): Decorrelation gradient hyperparameter.
+				- `sample_frac` (float): Fraction of data sampled for decorrelation
+					gradient calculation.
+
+		Raises:
+			AssertionError: If `mode` is not `"token"` or `"patch"`.
+		"""
 		super(DecorrConv1d, self).__init__(original_layer, **kwargs)
 
 		self.model_args = model_args
@@ -307,6 +426,10 @@ def apply_to_decorr(model, f):
 	Recursively traverses a model's structure and applies an arbitrary
 	function to the modules containing decorrelation layers. Used
 	for printing things out, performing simple operations, etc.
+	
+	Args:
+		f (Callable[[DecorrLinear], None])
+	
 	'''
 	def _apply_to_decorr(module):
 		for child in module.children():
@@ -317,22 +440,72 @@ def apply_to_decorr(model, f):
 
 
 class DecorrMamba(Mamba):
-	''' 
+	"""
 	Mamba architecture with built-in decorrelation layers and additional functionality
-	for training/monitoring them
+	for training and monitoring them.
 
-	'''
+	This class extends the `Mamba` architecture to add decorrelation layers, which 
+	are initialized and managed dynamically. It supports the following functionalities:
+	- Creation of decorrelation matrices in specific layers (e.g., `in_proj`, `out_proj`).
+	- Loss monitoring for decorrelation layers (e.g., correlation loss, whitening loss).
+	- Dynamic updates to decorrelation layers during training.
+
+	Attributes:
+		total_correlation_loss (float): The total correlation loss across all decorrelation layers.
+		total_whitening_loss (float): The total whitening loss across all decorrelation layers.
+		decorr_lr (float): Learning rate for updating decorrelation matrices.
+		conv_1d_mode (str): The mode used for 1D convolution decorrelation layers. "patch"
+			decorrelates all features seen by a convolutional kernel, "token" decorrelates
+			all token features independently. 
+		sample_frac (float): Fraction of the data sampled for decorrelation update calculations
+		kappa (float): Hyperparameter controlling contribution of whitening and decorrelation
+			loss terms in the gradient computation, for the decorrelation amtrices
+
+	Methods:
+		sum_decorr_losses():
+			Calculates and stores the total correlation and whitening losses from all decorrelation layers.
+
+		update_decorr_matrices():
+			Updates decorrelation matrices for all decorrelation layers using their respective gradients.
+
+		reset_decorr_grad():
+			Resets the gradients of decorrelation matrices after a forward pass.
+
+		reset_decorr_layers():
+			Resets the gradients and losses of decorrelation layers and the total summed losses.
+
+		compute_decorr_losses(mode: bool=True):
+			Enables or disables the computation of decorrelation losses during the forward pass.
+	"""
+
 	def __init__(self,  conv_1d_mode: str, model_args: MambaArgs = None, 
 		existing_model: Mamba = None, **kwargs):
 
-		# creates a standard Mamba model according to args, and then inserts 
-		# decorrelation matrices where appropriate. If a Mamba model is already
-		# specified, just extends the existing model with added functionality and
-		# decorrelation layers initialized at identity
+		"""
+		Initializes the DecorrMamba model.
+
+		Either creates a new Mamba model with decorrelation layers or extends an 
+		existing Mamba model with decorrelation functionality. In the latter case,
+		decorrelation matrices are initialized at identity.
+
+		Args:
+			conv_1d_mode (str): The mode used for 1D convolution decorrelation layers.
+			model_args (MambaArgs, optional): Arguments to configure a new Mamba model.
+			existing_model (Mamba, optional): Pre-existing Mamba model to modify.
+			**kwargs: Additional keyword arguments for decorrelation parameters:
+				- kappa (float): Hyperparameter for decorrelation gradient.
+				- sample_frac (float): Fraction of the data sampled for decorrelation 
+					matrix gradient calculations.
+				- decorr_lr (float): Learning rate for decorrelation updates.
+
+		Raises:
+			AssertionError: If neither `model_args` nor `existing_model` is provided.
+		"""
 
 		assert existing_model is not None or model_args is not None, \
 			"Specify either a MambaArgs object to create a new model," +\
 			" or a pre-made Mamba model to modify"
+
 
 		if existing_model is not None:
 			self.__dict__.update(deepcopy(existing_model).__dict__)
@@ -397,7 +570,7 @@ class DecorrMamba(Mamba):
 	def update_decorr_matrices(self):
 		''' 
 		Updates the decorrelation matrices for all decorrelation layers
-		within the model
+		within the Mamba model
 		'''
 		assert self.training, "Model must be in training mode"
 		assert self.decorr_lr is not None, "No decorr_lr specified"
@@ -412,24 +585,32 @@ class DecorrMamba(Mamba):
 		self.apply(_update_decorr_matrices)
 
 	def reset_decorr_grad(self):
-		''' Resets gradients of decorrelation matrices after forward pass'''
+		''' 
+		Resets gradients of decorrelation matrices after forward pass. 
+		Used between each minibatch update. 
+		'''
+
 		apply_to_decorr(self, lambda x: x.reset_grad())
 
 	def reset_decorr_layers(self):
 		''' 
 		Resets gradients and losses of decorrelation layers after parameter
 		updates. Also resets the summed total losses across all decorrelation
-		layers
+		layers. Used before beginning a new training epoch.
 		'''
 		apply_to_decorr(self, lambda x: x.reset())
 		self.total_correlation_loss = 0
 		self.total_whitening_loss = 0
 
 	def compute_decorr_losses(self, mode: bool=True):
-		'''
-		Turns the whitening and correlation loss computation during the 
-		forward pass on and off.
-		'''
+		"""
+		Enables or disables the computation of decorrelation losses during the 
+		forward pass. Useful for switching between training and inference modes.
+
+		Args:
+			mode (bool, default=True): If True, computes decorrelation losses; 
+									   if False, skips loss computation.
+		"""
 		apply_to_decorr(self, lambda x: setattr(x, "compute_loss", mode))
 
 			

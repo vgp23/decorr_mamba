@@ -24,7 +24,7 @@ class MambaTrainer:
 			model (Mamba)
 
 		Methods:
-			train(self, train_loader, val_loader): trains the architecture
+			train(self, train_loader, val_loader, backprop): trains the architecture
 				following the protocol in train_args, using provided 
 				training and validation datasets
 	'''
