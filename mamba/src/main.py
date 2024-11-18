@@ -1,6 +1,6 @@
 
 from model.mamba import Mamba
-from model.decorrelation import DecorrMamba, DecorrConv1d, apply_to_decorr
+from model.decorrelation import DecorrMamba, DecorrConv1d, apply_to_decorr, DecorrLoss
 from utils.trainer import MambaTrainer
 from torch.utils.data import DataLoader
 from utils.helpers import MambaArgs, TrainingArgs, DefaultArgs, LanguageDatasetMaker
@@ -59,20 +59,20 @@ if __name__ == "__main__":
 	    seqs = pickle.load(f)
 
 	L = 32
-	B = 8
+	B = 10
 	D = 16
 	N = 8
 
 	device = 'cpu' # hehe 
 	mamba_args = MambaArgs(N, D, n_layers=2)
 	decorr_model = DecorrMamba("patch", mamba_args, 
-		sample_frac=0.1, kappa=0.5, decorr_lr=0.001)
+		sample_frac=1.0, kappa=0.5, decorr_lr=0.001)
 
 
 	# defining the training protocol
 	default_train_args = DefaultArgs()
 	train_args = TrainingArgs(
-	    n_epochs=2, L=L, B=B, lr=5*1.5e-3, **default_train_args.lm_args, warmup_epochs=0)
+	    n_epochs=20, L=L, B=B, lr=5*1.5e-3, **default_train_args.lm_args, warmup_epochs=0)
 
 	datasets = LanguageDatasetMaker(seqs, mamba_args, train_args, total_dataset_frac=0.001,
 	                                train_split=0.5, val_split=0.5)
@@ -84,6 +84,8 @@ if __name__ == "__main__":
 	trainer = MambaTrainer(mamba_args, train_args, decorr_model)
 
 	trainer.train(train_loader, val_loader)
+
+
 
 
 

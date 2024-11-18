@@ -7,13 +7,13 @@ from utils.helpers import MambaArgs
 from functools import partial
 from copy import deepcopy
 
-class DecorrelationLoss(nn.Module):
+class DecorrLoss(nn.Module):
 	''' 
 	Computes the gradients and losses associated with the decorrelation update
 	'''
 
 	def __init__(self):
-		super(DecorrelationLoss, self).__init__()
+		super(DecorrLoss, self).__init__()
 
 
 	def forward(self, x, kappa: float, compute_grad: bool = True, 
@@ -40,8 +40,16 @@ class DecorrelationLoss(nn.Module):
 		C = xx_t - D
 
 		if compute_loss:
-			correlation_loss = torch.mean(C**2) # sum of squared covariances
-			whitening_loss = torch.mean(V**2) # sum of squared variances
+			# sum of squared covariances
+			correlation_loss = \
+				torch.mean(
+					torch.mean(C**2, dim=(1,2)))
+
+ 			# sum of squared variances
+			whitening_loss = \
+				torch.mean(
+					torch.mean(V**2, dim=(1,2)))
+
 		else:
 			correlation_loss = None 
 			whitening_loss = None
@@ -82,7 +90,7 @@ class DecorrLinear(nn.Module):
 		self.whitening_loss = 0
 		self.grad = None
 
-		self.loss = DecorrelationLoss()
+		self.loss = DecorrLoss()
 
 
 	def forward(self, x):
@@ -102,7 +110,7 @@ class DecorrLinear(nn.Module):
 			assert self.sample_frac is not None , \
 				"Specify sample_frac for loss and gradient computation"
 
-			assert self.sample_frac > 0 and self.sample_frac < 1.0, \
+			assert self.sample_frac > 0 and self.sample_frac <= 1.0, \
 				"sample_frac must be between 0 and 1"   
 
 			with torch.no_grad():
@@ -116,6 +124,7 @@ class DecorrLinear(nn.Module):
 				selected = x[batch_idx, sample_idx]
 
 				selected_decorr = selected @ self.decorr_layer.T
+
 				grad, correlation_loss, whitening_loss = self.loss(
 					selected_decorr, self.kappa, self.compute_grad, self.compute_loss)
 
@@ -171,6 +180,14 @@ class DecorrConv1d(DecorrLinear):
 
 
 	def forward(self, x):
+
+		if self.compute_grad or self.compute_loss:
+			assert self.sample_frac is not None , \
+				"Specify sample_frac for loss and gradient computation"
+
+			assert self.sample_frac > 0 and self.sample_frac <= 1.0, \
+				"sample_frac must be between 0 and 1"   
+
 		b, d, l = x.shape
 		# (B, n_patches, conv_1d_size*D). All data in each convolution patch
 		# is represented in a single vector
@@ -189,6 +206,8 @@ class DecorrConv1d(DecorrLinear):
 			# a single vector. Reshape these vectors into matrices, such
 			# that the 0th dimension of each matrix contains all features
 			# for the 0th dimension across all tokens, etc. 
+
+			#( B, n_patches, conv_1d_size, D)
 			patch_matrices = x_unfolded.reshape(
 				b, -1, d, self.model_args.conv_1d_size).transpose(2,3)
 
@@ -217,8 +236,33 @@ class DecorrConv1d(DecorrLinear):
 			# in each patch completes the dot product operation. 
 			y = torch.sum(decorr_conv_outputs, dim=2)
 			
-			if self.conv_biases is not None:
-				y += self.conv_biases       
+			if self.original_layer.bias is not None:
+				y += self.original_layer.bias 
+
+			# like in DecorrLinear, fusion of decorrelation and layer operation requires
+			# separate forward pass for gradient computation   
+			if self.compute_grad or self.compute_loss:     
+				with torch.no_grad():
+					# sample fraction of each batch from which to compute loss + update
+					x_t = x.transpose(1,2)
+
+					n_samples = int(self.sample_frac*l)
+
+					sample_idx = torch.multinomial(
+						torch.ones(b, l), n_samples, replacement=False)
+					batch_idx = torch.arange(b).unsqueeze(1).expand(b, n_samples)
+
+					selected = x_t[batch_idx, sample_idx]
+
+					selected_decorr = selected @ self.decorr_layer.T
+
+					grad, correlation_loss, whitening_loss = self.loss(
+						selected_decorr, self.kappa, self.compute_grad, self.compute_loss)
+
+					self.correlation_loss += correlation_loss
+					self.whitening_loss += whitening_loss
+					# updates happen on entire network at once in training loop
+					self.grad = grad   				      
 
 		# decorrelates all features in each input patch to the convolution
 		else:
@@ -235,35 +279,26 @@ class DecorrConv1d(DecorrLinear):
 			if self.original_layer.bias is not None:
 				y += self.original_layer.bias
 
-		# like in DecorrLinear, fusion of decorrelation and layer operation requires
-		# separate forward pass for gradient computation
-		if self.compute_grad or self.compute_loss:
+			if self.compute_grad or self.compute_loss:       
+				with torch.no_grad():
+					# sample fraction of each batch from which to compute loss + update
+					b, n_patches, n_patch_features = x_unfolded.shape
 
-			assert self.sample_frac is not None , \
-				"Specify sample_frac for loss and gradient computation"
+					n_samples = int(self.sample_frac*n_patches)
 
-			assert self.sample_frac > 0 and self.sample_frac < 1.0, \
-				"sample_frac must be between 0 and 1"           
+					sample_idx = torch.multinomial(
+						torch.ones(b, n_patches), n_samples, replacement=False)
+					batch_idx = torch.arange(b).unsqueeze(1).expand(b, n_samples)
 
-			with torch.no_grad():
-				# sample fraction of each batch from which to compute loss + update
-				b, n_patches, n_patch_features = x_unfolded.shape
+					selected_decorr = x_unfolded[batch_idx, sample_idx] @ self.decorr_layer.T
 
-				n_samples = int(self.sample_frac*n_patches)
+					grad, correlation_loss, whitening_loss = self.loss(
+						selected_decorr, self.kappa, self.compute_grad, self.compute_loss)
 
-				sample_idx = torch.multinomial(
-					torch.ones(b, n_patches), n_samples, replacement=False)
-				batch_idx = torch.arange(b).unsqueeze(1).expand(b, n_samples)
-
-				selected_decorr = x_unfolded[batch_idx, sample_idx] @ self.decorr_layer.T
-
-				grad, correlation_loss, whitening_loss = self.loss(
-					selected_decorr, self.kappa, self.compute_grad, self.compute_loss)
-
-				self.correlation_loss += correlation_loss
-				self.whitening_loss += whitening_loss
-				# updates happen on entire network at once in training loop
-				self.grad = grad                
+					self.correlation_loss += correlation_loss
+					self.whitening_loss += whitening_loss
+					# updates happen on entire network at once in training loop
+					self.grad = grad                
 
 		return y.transpose(1,2)
 
@@ -372,7 +407,7 @@ class DecorrMamba(Mamba):
 			for child in module.children():
 				if isinstance(child, DecorrLinear):
 					assert child.grad is not None, "Gradient not computed"
-					child.decorr_layer -= self.decorr_lr*child.decorr_layer
+					child.decorr_layer -= self.decorr_lr * child.grad @ child.decorr_layer
 
 		self.apply(_update_decorr_matrices)
 
@@ -383,9 +418,12 @@ class DecorrMamba(Mamba):
 	def reset_decorr_layers(self):
 		''' 
 		Resets gradients and losses of decorrelation layers after parameter
-		updates
+		updates. Also resets the summed total losses across all decorrelation
+		layers
 		'''
 		apply_to_decorr(self, lambda x: x.reset())
+		self.total_correlation_loss = 0
+		self.total_whitening_loss = 0
 
 	def compute_decorr_losses(self, mode: bool=True):
 		'''

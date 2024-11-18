@@ -62,7 +62,7 @@ class MambaTrainer:
 			# but the logic above counts this parameter twice. Remove to fix.
 			del self._param_groups["decay"][-1]
 
-	def train(self, train_loader: DataLoader, val_loader: DataLoader):
+	def train(self, train_loader: DataLoader, val_loader: DataLoader, backprop: bool=True):
 
 		''' 
 		Trains the model with the protocol specified in train_args.
@@ -70,10 +70,15 @@ class MambaTrainer:
 		Args:
 			train_loader (DataLoader): PyTorch-compatible training dataloader
 			val_loader (DataLoader): PyTorch-compatible validation dataloader
+			backprop (bool): turns off parameter updating for everything
+				other than decorrelation matrices, allows for sanity check
+				of decorrelation learning rule
 
 		'''
 
 		criterion = nn.CrossEntropyLoss()
+		if not backprop:
+			print("Warning: only training decorrelation matrices!")
 
 		# used in language modelling, usually
 		if self.train_args.weight_decay is not None:
@@ -115,6 +120,7 @@ class MambaTrainer:
 				# resets gradients and losses of decorrelation matrices
 				self.model.reset_decorr_layers()
 
+
 			train_loss = 0.0
 		
 			for in_seq, target_seq in tqdm(train_loader):
@@ -127,14 +133,17 @@ class MambaTrainer:
 				loss = criterion(out_seq.view(-1, self.mamba_args.vocab_size), target_seq.view(-1))
 				train_loss += loss.item()
 
-				optimizer.zero_grad()
-				loss.backward()	
+				if backprop:
+					optimizer.zero_grad()
+					loss.backward()	
 
 				# gradient clipping
 				if self.train_args.gradient_clip is not None:
 					torch.nn.utils.clip_grad_norm_(self.model.parameters(), 
 												   self.train_args.gradient_clip)
-				optimizer.step()
+
+				if backprop:
+					optimizer.step()
 
 				# update the decorrelation matrices AFTER standard backprop, else training breaks!
 				if isinstance(self.model, DecorrMamba):
@@ -150,7 +159,7 @@ class MambaTrainer:
 			print(f"Train loss: {train_loss:.4f}, Train perplexity: {train_perplexity:.4f}")
 
 			if isinstance(self.model, DecorrMamba):
-				# batch losses are summed automatically for each decorrelation layer within the model.
+				# epoch losses are summed automatically for each decorrelation layer within the model.
 				# this just sums all of these sums across every decorrelation layer and stores
 				# them within the parent model
 				self.model.sum_decorr_losses()			
@@ -164,7 +173,7 @@ class MambaTrainer:
 
 			# -------------------------------- validation -------------------------------------	
 
-			apply_to_decorr(self.model, lambda module: print(getattr(module, "decorr_layer")))
+			# apply_to_decorr(self.model, lambda module: print(getattr(module, "decorr_layer")))
 
 			self.model.eval()
 
