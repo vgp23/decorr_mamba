@@ -194,15 +194,21 @@ class DecorrLinear(nn.Module):
 
 	def forward(self, x):
 
-		# for efficiency, multiply decorrelation and standard weight matrices together before
-		# passing input through the resulting single matrix
-		y = x @ (self.original_layer.weight @ self.decorr_layer).T
+		if self.fuse: # fused operation
+			y = x @ (self.original_layer.weight @ self.decorr_layer).T
+
+		else: # unfused operation
+			decorr_out = x @ self.decorr_layer.T
+			y = decorr_out @ (self.original_layer.weight).T
 
 		if self.original_layer.bias is not None:
 			y += self.original_layer.bias
 
-		# caveat: optimization above requires another forward pass through just the
-		# decorrelation matrix to compute the loss and gradients
+		# the only time we're using the unfused operations is for debugging
+		# purposes/sanity checks; loss and gradient computation assume 
+		# the fused operation has been used, needing a sampled fraction of
+		# training data to be passed through the decorrelation matrix again. 
+
 		if self.compute_grad or self.compute_loss:
 
 			# sample only a fraction of each batch
@@ -251,17 +257,6 @@ class DecorrLinear(nn.Module):
 			# allows loss to also be computed in eval mode      
 			self.compute_loss = True
 
-# in case you want to compute the unfused token operation, here's the code (used during testing)
-	# decorr_out = x_unfolded @ self.decorr_layer.T
-
-	# decorr_out_reshape = decorr_out.reshape(
-	# 	b, -1, d, self.model_args.conv_1d_size).transpose(2,3)
-
-	# y = einsum(decorr_out_reshape, torch.squeeze(self.original_layer.weight),
-	# 	'b n_patches conv_1d_size d, d conv_1d_size -> b n_patches d')
-
-
-
 
 class DecorrConv1d(DecorrLinear):
 	"""
@@ -303,7 +298,8 @@ class DecorrConv1d(DecorrLinear):
 		Raises:
 			AssertionError: If `mode` is not `"token"` or `"patch"`.
 		"""
-		super(DecorrConv1d, self).__init__(original_layer, **kwargs)
+		super(DecorrConv1d, self).__init__(
+			original_layer=original_layer, fuse=fuse, **kwargs)
 
 		self.model_args = model_args
 		self.mode = mode
@@ -334,59 +330,89 @@ class DecorrConv1d(DecorrLinear):
 			assert self.sample_frac > 0 and self.sample_frac <= 1.0, \
 				"sample_frac must be between 0 and 1"   
 
+		# NB: although the option to use unfused operations exists for all modes,
+		# training assumes that the operations are fused and that the decorrelated
+		# inputs are not directly available, needing another forward pass through
+		# just the decorrelation matrices.
+
 		b, d, l = x.shape
-		# (B, n_patches, conv_1d_size*D). All data in each convolution patch
-		# is represented in a single vector
+
+		# all data in each convolution patch is represented in a single vector
+		# (B, n_patches, conv_1d_size*D)
 		x_unfolded = F.unfold(
 			x.unsqueeze(1), (d, self.model_args.conv_1d_size), 
 			stride=1, padding=(0, self.model_args.conv_1d_size-1)).transpose(1,2)
 
-		# decorrelates each token's features independently. As in DecorrLinear, decorrelation
-		# and convolutional operations are fused together into one matrix. Convolutions
-		# in Mamba only mix information across the same token dimension,
-		# (groups = D_inner), making the convolution operation a series of dot 
-		# products within the unfolded patch, not a regular matrix multiplication.
+		# NB for rest of implementation: Conv1d in Mamba defines a separate kernel for
+		# each embedding dimension (n_groups = D_inner). This avoids mixing 
+		# information across channels, which is important as SSM components operate on 
+		# each embedding dimension independently. 
 
+		# decorrelates each token's features across the embedding dimension
 		if self.mode == "token":
-			# currently each patch's features are represented in
-			# a single vector. Reshape these vectors into matrices, such
-			# that the 0th dimension of each matrix contains all features
-			# for the 0th dimension across all tokens, etc. 
 
-			#( B, n_patches, conv_1d_size, D)
-			patch_matrices = x_unfolded.reshape(
-				b, -1, d, self.model_args.conv_1d_size).transpose(2,3)
+			if self.fuse: # fused decorrelation and convolution
+				# represent each patch as a matrix, with embedding channels grouped
+				# in the last dimension				
+				# (B, n_patches, D, conv_1d_size)
+				patch_matrices = x_unfolded.reshape(
+					b, -1, d, self.model_args.conv_1d_size)
 
-			# decorr + conv1d for one patch is a matrix multiplication
-			# of the matrix representation of the patch with the decorrelation
-			# matrix, followed by row-wise dot products of the output with the 
-			# convolution weights. This can be fused into one operation by defining
-			# a separate scaled version of the decorrelation matrix for each token
-			# in a convolutional patch, passing the tokens through their respective
-			# matrices, and then summing over the token dimension
+				# the unfused operation passes each token embedding through
+				# the same decorrelation matrix, then performs convolution via
+				# row-wise dot products of the kernels with the decorrelated 
+				# patch matrix. We fuse these by defining a separate kernel-scaled version 
+				# of the decorrelation matrix for each token in the patch, passing the 
+				# tokens through their respective matrices, and then summing over the 
+				# token dimension
 
-			token_specific_decorr = self.decorr_layer.unsqueeze(0).repeat(
-				self.model_args.conv_1d_size, 1, 1)
+				# (conv_1d_size, D, D)
+				token_specific_decorr = self.decorr_layer.unsqueeze(0).repeat(
+					self.model_args.conv_1d_size, 1, 1)
 
-			token_specific_decorr = einsum(token_specific_decorr, 
-				torch.squeeze(self.original_layer.weight).T,
+				# d1 and d2 refer to the dimensions of each decorrelation matrix;
+				# the kernel scaling operations make them lose their symmetry.
 
-				'conv_1d_size out_dim in_dim, conv_1d_size out_dim' +
-				' -> conv_1d_size out_dim in_dim')
+				# (conv_1d_size, D, D)
+				token_specific_decorr = einsum(token_specific_decorr, 
+					torch.squeeze(self.original_layer.weight),
+					'conv_1d_size d1 d2, d1 conv_1d_size' +
+					' -> conv_1d_size d1 d2')
 
-			decorr_conv_outputs = einsum(patch_matrices, token_specific_decorr,
-				'b n_patches conv_1d_size in_dim, conv_1d_size out_dim in_dim' + 
-				' -> b n_patches conv_1d_size out_dim')
+				# pass inputs through token-specific decorrelation matrices.
 
-			# (B, n_patches, D). Summing over the decorrelated + scaled tokens
-			# in each patch completes the dot product operation. 
-			y = torch.sum(decorr_conv_outputs, dim=2)
+				# (B, n_patches, conv_1d_size, D)
+				decorr_conv_outputs = einsum(token_specific_decorr, patch_matrices, 
+					'conv_1d_size d1 dummy, b n_patches dummy conv_1d_size' + 
+					' -> b n_patches conv_1d_size d1')
+
+				# summing over the decorrelated + scaled tokens
+				# in each patch completes the dot product operation
+
+				# (B, n_patches, D)
+				y = torch.sum(decorr_conv_outputs, dim=2)
 			
-			if self.original_layer.bias is not None:
-				y += self.original_layer.bias 
+			else: # unfused operation
 
-			# like in DecorrLinear, fusion of decorrelation and layer operation requires
-			# separate forward pass for gradient computation   
+				# avoid redundant decorrelation operations by operating on original input 
+				# (B, L, D)
+				decorr_inputs = x.transpose(1,2) @ self.decorr_layer.T
+
+				# unfold and perform convolution as normal
+
+				# (B, n_patches, conv_1d_size*D)
+				x_decorr_unfolded = F.unfold(
+					decorr_inputs.transpose(1,2).unsqueeze(1), (d, self.model_args.conv_1d_size), 
+					stride=1, padding=(0, self.model_args.conv_1d_size-1)).transpose(1,2)
+
+				# (B, n_patches, D, conv_1d_size)
+				decorr_patch_matrices = x_decorr_unfolded.reshape(
+					b, -1, d, self.model_args.conv_1d_size)			
+
+				y = einsum(torch.squeeze(self.original_layer.weight), decorr_patch_matrices,
+					'd dummy, b n_patches d dummy -> b n_patches d')
+
+			# forward pass for gradients & losses  
 			if self.compute_grad or self.compute_loss:     
 				with torch.no_grad():
 					# sample fraction of each batch from which to compute loss + update
@@ -412,19 +438,35 @@ class DecorrConv1d(DecorrLinear):
 
 		# decorrelates all features in each input patch to the convolution
 		elif self.mode == "patch":
-			# split up decorrelation matrix to pre-multiply with each channel's kernel
-			# (D, D*conv_1d_size (= n_patch_features), conv_1d_size)
-			decorr_reshape = self.decorr_layer.reshape(
-				d, self.model_args.conv_1d_size, d*self.model_args.conv_1d_size).transpose(1,2)
 
-			fused_matrix = einsum(torch.squeeze(self.original_layer.weight), decorr_reshape,
-				'd conv_1d_size, d n_patch_features conv_1d_size -> d n_patch_features')
+			if self.fuse: # fused operation
+				# split up decorrelation matrix to pre-multiply with each channel's kernel
 
-			y = x_unfolded @ fused_matrix.T
+				# (D, conv_1d_size, D*conv_1d_size (= n_patch_features))
+				decorr_split = self.decorr_layer.reshape(
+					d, self.model_args.conv_1d_size, d*self.model_args.conv_1d_size)
 
-			if self.original_layer.bias is not None:
-				y += self.original_layer.bias
+				fused_matrix = einsum(
+					decorr_split, torch.squeeze(self.original_layer.weight),
+					'd dummy n_patch_features, d dummy -> d n_patch_features')
 
+				y = x_unfolded @ fused_matrix.T
+
+			else: # unfused operation
+
+				# (B, n_patches, D*conv_1d_size)
+				decorr = x_unfolded @ self.decorr_layer.T
+
+				# fold patch vectors back up into matrices, then multiply
+				# with convolutional kernels
+
+				# (B, n_patches, D, conv_1d_size)
+				decorr_patches = decorr.reshape(b,-1, d, self.model_args.conv_1d_size)
+
+				y = einsum(torch.squeeze(self.original_layer.weight), decorr_patches,
+					"d dummy, b n_patches d dummy -> b n_patches d")
+
+			# forward pass for gradients & losses
 			if self.compute_grad or self.compute_loss:       
 				with torch.no_grad():
 					# sample fraction of each batch from which to compute loss + update
@@ -485,10 +527,7 @@ class DecorrConv1d(DecorrLinear):
 				y = einsum(torch.squeeze(self.original_layer.weight), decorrelated, 
 					'd dummy, b n_patches dummy d -> b n_patches d')
 
-
-			if self.original_layer.bias is not None:
-				y += self.original_layer.bias
-
+			# forward pass for gradients & losses
 			if self.compute_grad or self.compute_loss:
 				# sample fraction of each batch from which to compute loss + update.
 				# each channel counts as an independent input to potentially sample.
@@ -514,9 +553,13 @@ class DecorrConv1d(DecorrLinear):
 				self.correlation_loss += correlation_loss
 				self.whitening_loss += whitening_loss
 				# updates happen on entire network at once in training loop
-				self.grad = grad   				      						           
+				self.grad = grad
+
+		if self.original_layer.bias is not None:
+			y += self.original_layer.bias
 
 		return y.transpose(1,2)
+
 
 def apply_to_decorr(model, f):
 	''' 

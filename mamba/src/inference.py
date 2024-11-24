@@ -48,7 +48,7 @@ if __name__ == "__main__":
     # model = Mamba.from_pretrained('state-spaces/mamba-1.4b')
 
     model = DecorrMamba(
-        existing_model=model, conv_1d_mode="channel_shared").to(device)
+        existing_model=model, conv_1d_mode="patch", fuse=False).to(device)
     model.eval()
     model.compute_decorr_losses(False)
 
