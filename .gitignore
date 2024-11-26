@@ -155,7 +155,7 @@ dmypy.json
 .DS_Store
 
 decorr_mamba/decorr_mamba.egg-info
-
+.checkpoints
 
 
 
