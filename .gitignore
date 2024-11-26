@@ -154,9 +154,9 @@ dmypy.json
 # the bane
 .DS_Store
 
-mamba/src/gpt2tokenizer/
-mamba/src/checkpoints
-reference/
+decorr_mamba/decorr_mamba.egg-info
+experiments
+
 
 
 
