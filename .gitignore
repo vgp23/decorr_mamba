@@ -154,7 +154,7 @@ dmypy.json
 # the bane
 .DS_Store
 
-decorr_mamba/decorr_mamba.egg-info
+decorr_mamba/decorr_mamba.egg-info/
 **/checkpoints/
 
 
