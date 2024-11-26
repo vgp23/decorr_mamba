@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F 
-from model.mamba import Mamba
+from ..model.mamba import Mamba
 from einops import einsum
-from utils.helpers import MambaArgs
+from ..utils.helpers import MambaArgs
 from functools import partial
 from copy import deepcopy
 
@@ -24,7 +24,7 @@ class DecorrLoss(nn.Module):
 
 
 	def forward(self, x, kappa: float, compute_grad: bool = True, 
-		compute_loss: bool = True):
+		compute_loss: bool = True, batched: bool = False):
 
 		"""
 		Computes the decorrelation gradient and/or losses for the given input tensor.
@@ -42,6 +42,8 @@ class DecorrLoss(nn.Module):
 				decorrelation matrix. Defaults to `True`.
 			compute_loss (bool, optional): If `True`, computes the decorrelation 
 				losses (correlation and whitening). Defaults to `True`.
+			batchde (bool, optional): If 'True' computes losses and gradients
+				for a batch of decorrelation matrices at once. Defaults to 'False'
 
 		Returns:
 			Tuple[torch.Tensor or None, float or None, float or None]:
@@ -75,40 +77,92 @@ class DecorrLoss(nn.Module):
 		assert kappa is not None, "Specify kappa for loss and gradient computation"
 		assert kappa <= 1.0 and kappa >= 0.0, "kappa must be between 0 and 1"
 
-		# collapse across batch dimension
-		b, l, d = x.shape
-		x = x.reshape(b*l, d)
+		# used for all modes where the decorrelation layer has only a single
+		# matrix to train 
+		if not batched:
+			# collapse across batch dimension
+			b, l, d = x.shape
+			x = x.reshape(b*l, d)
 
-		# compute the individual loss elements
-		D = torch.diag_embed(x**2)
-		V = D - torch.eye(d)
+			# compute the individual loss elements
+			D = torch.diag_embed(x**2)
+			V = D - torch.eye(d)
 
-		xx_t = einsum(x, x, 'b x, b x_t -> b x x_t')
+			xx_t = einsum(x, x, 'b x, b x_t -> b x x_t')
 
-		C = xx_t - D
+			C = xx_t - D
 
-		if compute_loss:
-			# sum of squared covariances
-			correlation_loss = \
-				torch.mean(
-					torch.mean(C**2, dim=(1,2)))
+			if compute_loss:
+				# sum of squared covariances
+				correlation_loss = \
+					torch.mean(
+						torch.mean(C**2, dim=(1,2)))
 
-			# sum of squared variances
-			whitening_loss = \
-				torch.mean(
-					torch.mean(V**2, dim=(1,2)))
+				# sum of squared variances
+				whitening_loss = \
+					torch.mean(
+						torch.mean(V**2, dim=(1,2)))
 
+			else:
+				correlation_loss = None 
+				whitening_loss = None
+
+			# compute the actual gradient, if applicable
+			if compute_grad:
+				grad = torch.mean(((1-kappa)*C + kappa*V), dim=0)
+			else:
+				grad = None
+
+			return grad, correlation_loss, whitening_loss
+
+		# used where decorrelation layer has multiple matrices to train
+		# (this is the case for "channel_universal")
 		else:
-			correlation_loss = None 
-			whitening_loss = None
+			b, n_samples, d, conv_1d_size = x.shape
+			# in this case we're updating d matrices, each with info
+			# from one embedding dimension channel. Rearrange dimensions
+			# and collapse all samples into a single dimension. 
 
-		# compute the actual gradient, if applicable
-		if compute_grad:
-			grad = torch.mean(((1-kappa)*C + kappa*V), dim=0)
-		else:
-			grad = None
+			# (D, all_samples, conv_1d_size)
+			x = x.permute(2, 0, 1, 3).reshape(d, -1, conv_1d_size)
 
-		return grad, correlation_loss, whitening_loss
+			# compute the individual loss elements
+			D = torch.diag_embed(x**2)
+			V = D - torch.eye(conv_1d_size)
+
+			xx_t = einsum(x, x, 
+				'd all_samples x, d all_samples x_t -> d all_samples x x_t')
+
+			# (D, all_samples, conv_1d_size, conv_1d_size)
+			C = xx_t - D
+
+			if compute_loss:
+				# sum of squared covariances, averaged across 
+				# all samples, then averaged across all parallel channels
+				correlation_loss = \
+					torch.mean(
+						torch.mean(
+							torch.mean(C**2, dim=(2,3)), dim=1))
+
+				# sum of squared variances, averaged across 
+				# all samples, then averaged across all parallel channels
+				whitening_loss = \
+					torch.mean(
+						torch.mean(
+							torch.mean(V**2, dim=(2,3)), dim=1))
+
+			else:
+				correlation_loss = None 
+				whitening_loss = None
+
+			# compute the actual gradients, if applicable
+			if compute_grad:
+				grad = torch.mean(((1-kappa)*C + kappa*V), dim=1)
+			else:
+				grad = None
+
+			return grad, correlation_loss, whitening_loss
+			
 	
 
 class DecorrLinear(nn.Module):
@@ -231,7 +285,8 @@ class DecorrLinear(nn.Module):
 				selected_decorr = selected @ self.decorr_layer.T
 
 				grad, correlation_loss, whitening_loss = self.loss(
-					selected_decorr, self.kappa, self.compute_grad, self.compute_loss)
+					selected_decorr, self.kappa, 
+					compute_grad=self.compute_grad, compute_loss=self.compute_loss)
 
 				self.correlation_loss += correlation_loss
 				self.whitening_loss += whitening_loss
@@ -305,21 +360,32 @@ class DecorrConv1d(DecorrLinear):
 		self.mode = mode
 
 		# determines how the decorrelation is applied.
-		assert mode == "token" or mode == "patch" or mode == "channel_shared", \
-			"conv_1d_mode must be \"token\", \"patch\", or \"channel_shared\""
+		assert mode == "token" or mode == "patch" \
+			or mode == "channel_shared" or mode == "channel_independent", \
+			"conv_1d_mode must be \"token\", \"patch\", \"channel_shared\", or \"channel_independent\""
 
 		if mode == "token":
 			# decorrelate each token's features independently
 			self.decorr_layer = nn.Parameter(torch.eye(model_args.D_inner), requires_grad=False)
+
 		elif mode == "patch":
 			# decorrelate all input features within each convolutional patch
 			self.decorr_layer = nn.Parameter(
 				torch.eye(model_args.D_inner*model_args.conv_1d_size), requires_grad=False)
-		else:
+
+		elif mode == "channel_shared":
 			# decorrelate each patch channel's input features independently,
-			# using the same decorrelation matrix for all of them
+			# using the same decorrelation matrix for all channels
 			self.decorr_layer = nn.Parameter(
 				torch.eye(model_args.conv_1d_size), requires_grad=False)
+
+		else:
+			# decorrelate each patch channel's input features independently,
+			# using a separate decorrelation matrix for all channels
+			all_matrices = torch.eye(model_args.conv_1d_size).unsqueeze(0).repeat(
+					model_args.D_inner, 1, 1)
+
+			self.decorr_layer = nn.Parameter(all_matrices, requires_grad=False)
 
 	def forward(self, x):
 
@@ -387,7 +453,7 @@ class DecorrConv1d(DecorrLinear):
 					' -> b n_patches conv_1d_size d1')
 
 				# summing over the decorrelated + scaled tokens
-				# in each patch completes the dot product operation
+				# in each patch completes the convolutional operation
 
 				# (B, n_patches, D)
 				y = torch.sum(decorr_conv_outputs, dim=2)
@@ -489,8 +555,8 @@ class DecorrConv1d(DecorrLinear):
 					self.grad = grad  
 
 		# decorrelates each patch channel's input features independently,
-		# using the same decorrelation matrix for all of them					
-		else:   
+		# using the same decorrelation matrix for all channels					
+		elif self.mode == "channel_shared":   
 			# represent each patch as a matrix, with embedding channels grouped
 			# in the last dimension
 
@@ -529,31 +595,107 @@ class DecorrConv1d(DecorrLinear):
 
 			# forward pass for gradients & losses
 			if self.compute_grad or self.compute_loss:
-				# sample fraction of each batch from which to compute loss + update.
-				# each channel counts as an independent input to potentially sample.
-				b, n_patches, d, _ = patch_matrices.shape
-				# collapse across the n_patches dimension, we want to sample 
-				# individual embedding dimension channel information across
-				# patches.	
-				all_patch_channel_info = patch_matrices.reshape(b, n_patches*d, -1)
+				with torch.no_grad():				
+					# sample fraction of each batch from which to compute loss + update.
+					# each channel counts as an independent input to potentially sample.
+					b, n_patches, d, _ = patch_matrices.shape
+					# collapse across the n_patches dimension, we want to sample 
+					# individual embedding dimension channel information across
+					# patches.	
+					all_patch_channel_info = patch_matrices.reshape(b, n_patches*d, -1)
 
-				n_samples = int(self.sample_frac*n_patches*d)
+					n_samples = int(self.sample_frac*n_patches*d)
 
-				sample_idx = torch.multinomial(
-					torch.ones(b, n_patches*d), n_samples, replacement=False)
-				batch_idx = torch.arange(b).unsqueeze(1).expand(b, n_samples)
+					sample_idx = torch.multinomial(
+						torch.ones(b, n_patches*d), n_samples, replacement=False)
+					batch_idx = torch.arange(b).unsqueeze(1).expand(b, n_samples)
 
-				selected = all_patch_channel_info[batch_idx, sample_idx]
+					selected = all_patch_channel_info[batch_idx, sample_idx]
 
-				selected_decorr = selected @ self.decorr_layer.T
+					selected_decorr = selected @ self.decorr_layer.T
 
-				grad, correlation_loss, whitening_loss = self.loss(
-					selected_decorr, self.kappa, self.compute_grad, self.compute_loss)
+					grad, correlation_loss, whitening_loss = self.loss(
+						selected_decorr, self.kappa, self.compute_grad, self.compute_loss)
 
-				self.correlation_loss += correlation_loss
-				self.whitening_loss += whitening_loss
-				# updates happen on entire network at once in training loop
-				self.grad = grad
+					self.correlation_loss += correlation_loss
+					self.whitening_loss += whitening_loss
+					# updates happen on entire network at once in training loop
+					self.grad = grad
+
+		# decorrelates each patch channel's input features independently,
+		# using a separate decorrelation matrix for all channels	
+		else:
+			# represent each patch as a matrix, with embedding channels grouped
+			# in the last dimension
+
+			#(B, n_patches, D, conv_1d_size)
+			patch_matrices = x_unfolded.reshape(
+				b, -1, d, self.model_args.conv_1d_size)
+
+			if self.fuse: # fused decorrelation and convolution
+
+				# pre-multiply each individual decorrelation matrix (one for each
+				# channel) by its corresponding kernel, row-wise (each matrix row
+				# gets multiplied by the corresponding scalar within the kernel)
+
+				# "target" dimension just indicates where the products are happening,
+				# it's inappropriate to call it "dummy" since it's not getting summed over
+
+				# (D, conv_1d_size, conv_1d_size)
+				decorr_kernels = einsum(
+					torch.squeeze(self.original_layer.weight), self.decorr_layer, 
+					'd target, d target conv_1d_size -> d target conv_1d_size')
+
+				# pass each patch matrix embedding dimension vector through its
+				# corresponding scaled decorrelation matrix
+
+				# (B, n_patches, D, conv_1d_size)
+				decorr_conv_outputs = einsum(decorr_kernels, patch_matrices,
+					'd conv_1d_size dummy, b n_patches d dummy -> b n_patches d conv_1d_size')
+
+				# summing across last dimension completes the convolutional operation
+				y = torch.sum(decorr_conv_outputs, dim=3)
+
+			else: # unfused operation
+				
+				# perform decorrelation
+				# (B, n_patches, conv_1d_size, D)
+				decorrelated =  einsum(self.decorr_layer, patch_matrices,
+					'd conv_1d_size dummy, b n_patches d dummy -> b n_patches conv_1d_size d')
+
+				# perform convolution on decorrelated inputs
+				y = einsum(torch.squeeze(self.original_layer.weight), decorrelated, 
+					'd dummy, b n_patches dummy d -> b n_patches d')
+
+			if self.compute_grad or self.compute_loss:
+				with torch.no_grad():				
+					# sample fraction of each batch from which to compute loss + update.
+					b, n_patches, _, _ = patch_matrices.shape
+
+					# we sample a fixed fraction of the number of patches within each batch,
+					# and compute gradients/losses for all of the decorrelation matrices
+					# using each sample
+					n_samples = int(self.sample_frac*n_patches)
+
+					sample_idx = torch.multinomial(
+						torch.ones(b, n_patches), n_samples, replacement=False)
+					batch_idx = torch.arange(b).unsqueeze(1).expand(b, n_samples)
+
+					selected = patch_matrices[batch_idx, sample_idx]
+
+					selected_decorr = einsum(self.decorr_layer, selected,
+						'd conv_1d_size dummy, b n_samples d dummy -> b n_samples d conv_1d_size')
+
+					grad, correlation_loss, whitening_loss = self.loss(
+						selected_decorr, self.kappa, 
+						compute_grad=self.compute_grad, compute_loss=self.compute_loss,
+						batched=True)
+
+					self.correlation_loss += correlation_loss
+					self.whitening_loss += whitening_loss
+					# updates happen on entire network at once in training loop
+					self.grad = grad 
+
 
 		if self.original_layer.bias is not None:
 			y += self.original_layer.bias

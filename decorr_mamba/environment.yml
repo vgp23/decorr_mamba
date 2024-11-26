@@ -1,0 +1,9 @@
+name: thesis_env
+channels:
+  - defaults
+dependencies:
+  - anaconda
+  - transformers
+  - textblob
+  - matplotlib
+prefix: /opt/anaconda3/envs/thesis_env

@@ -1,8 +1,8 @@
-from model.mamba import Mamba 
+from decorr_mamba.model.mamba import Mamba 
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
-from model.decorrelation import DecorrMamba
+from decorr_mamba.model.decorrelation import DecorrMamba
 
 def generate(model: Mamba,
              tokenizer: AutoTokenizer,
@@ -48,7 +48,7 @@ if __name__ == "__main__":
     # model = Mamba.from_pretrained('state-spaces/mamba-1.4b')
 
     model = DecorrMamba(
-        existing_model=model, conv_1d_mode="patch", fuse=False).to(device)
+        existing_model=model, conv_1d_mode="channel_independent", fuse=True).to(device)
     model.eval()
     model.compute_decorr_losses(False)
 

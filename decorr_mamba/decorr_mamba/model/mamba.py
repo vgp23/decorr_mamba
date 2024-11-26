@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 # from einops import rearrange, repeat, einsum # might be useful later
-from utils.helpers import MambaArgs
+from ..utils.helpers import MambaArgs
 import math
 from functools import partial
 import json

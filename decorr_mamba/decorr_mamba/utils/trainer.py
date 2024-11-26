@@ -4,11 +4,11 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm 
 import os
-from model.decorrelation import DecorrMamba, apply_to_decorr
+import json
 
-# from einops import rearrange, repeat # might be useful later
-from utils.helpers import MambaArgs, TrainingArgs
-from model.mamba import Mamba
+from ..utils.helpers import MambaArgs, TrainingArgs
+from ..model.mamba import Mamba
+from ..model.decorrelation import DecorrMamba
 
 class MambaTrainer:
 	''' Trains a Mamba architecture according to a pre-specified configuration
@@ -62,7 +62,8 @@ class MambaTrainer:
 			# but the logic above counts this parameter twice. Remove to fix.
 			del self._param_groups["decay"][-1]
 
-	def train(self, train_loader: DataLoader, val_loader: DataLoader, backprop: bool=True):
+	def train(self, train_loader: DataLoader, val_loader: DataLoader, 
+		backprop: bool=True, save_checkpoints: bool=True, save_all_checkpoints: bool=False):
 
 		''' 
 		Trains the model with the protocol specified in train_args.
@@ -70,15 +71,24 @@ class MambaTrainer:
 		Args:
 			train_loader (DataLoader): PyTorch-compatible training dataloader
 			val_loader (DataLoader): PyTorch-compatible validation dataloader
-			backprop (bool): turns off parameter updating for everything
+			backprop (bool, optional): turns off parameter updating for everything
 				other than decorrelation matrices, allows for sanity check
-				of decorrelation learning rule
+				of decorrelation learning rule. Defaults to 'True'
+			save_checkpoints (bool, optional): controls whether checkpoints are saved
+				during epochs. Defaults to 'True'
+			save_all_checkpoints (bool, optional): if saving checkpoints, controls
+				whether all epoch checkpoints are saved or just those where the loss
+				is better than the previous minimum. Defaults to 'False'	
 
 		'''
 
 		criterion = nn.CrossEntropyLoss()
 		if not backprop:
 			print("Warning: only training decorrelation matrices!")
+
+		if not save_checkpoints:
+			assert not save_all_checkpoints, \
+			"Cannot save all checkpoints, as save_checkpoints is set to False." 
 
 		# used in language modelling, usually
 		if self.train_args.weight_decay is not None:
@@ -108,8 +118,24 @@ class MambaTrainer:
 				optimizer, lr_lambda=self.train_args.schedule_fn)
 
 		min_loss = float("inf")
+		
 		save_path = os.path.join(".", "checkpoints")
 		os.makedirs(save_path, exist_ok=True)
+
+		# tracks losses across each epoch
+		cross_entropy_train_losses = []
+		train_perplexities = []
+		cross_entropy_val_losses = []	
+		val_perplexities = []
+
+		if isinstance(self.model, DecorrMamba):	
+			correlation_train_losses = []
+			whitening_train_losses = []
+
+			correlation_val_losses = []
+			whitening_val_losses = []
+
+
 
 		for epoch in range(self.train_args.n_epochs):
 			print(f"Epoch: {epoch + 1}/{self.train_args.n_epochs}")
@@ -158,18 +184,24 @@ class MambaTrainer:
 			train_perplexity = math.exp(train_loss)
 			print(f"Train loss: {train_loss:.4f}, Train perplexity: {train_perplexity:.4f}")
 
+			cross_entropy_train_losses.append(train_loss)
+			train_perplexities.append(train_perplexity)
+
 			if isinstance(self.model, DecorrMamba):
 				# epoch losses are summed automatically for each decorrelation layer within the model.
 				# this just sums all of these sums across every decorrelation layer and stores
 				# them within the parent model
 				self.model.sum_decorr_losses()			
-				total_correlation_loss = self.model.total_correlation_loss
-				total_whitening_loss = self.model.total_whitening_loss
+				total_correlation_loss = self.model.total_correlation_loss.item()
+				total_whitening_loss = self.model.total_whitening_loss.item()
 
 				correlation_loss = total_correlation_loss / len(train_loader)
 				whitening_loss = total_whitening_loss / len(train_loader)
 				print(
 					f"Train correlation loss: {correlation_loss:.4f}, Train whitening loss: {whitening_loss:.4f}")
+
+				correlation_train_losses.append(correlation_loss)
+				whitening_train_losses.append(whitening_loss)
 
 			# -------------------------------- validation -------------------------------------	
 
@@ -194,19 +226,50 @@ class MambaTrainer:
 			val_perplexity = math.exp(val_loss)
 			print(f"Val loss: {val_loss:.4f}, Val perplexity: {val_perplexity:.4f}")
 
+			cross_entropy_val_losses.append(val_loss)
+			val_perplexities.append(val_perplexity)
+
 			if isinstance(self.model, DecorrMamba):
 				self.model.sum_decorr_losses()			
-				total_correlation_loss = self.model.total_correlation_loss
-				total_whitening_loss = self.model.total_whitening_loss
+				total_correlation_loss = self.model.total_correlation_loss.item()
+				total_whitening_loss = self.model.total_whitening_loss.item()
 
 				correlation_loss = total_correlation_loss / len(train_loader)
 				whitening_loss = total_whitening_loss / len(train_loader)
-				print(f"Val correlation loss: {correlation_loss:.4f}, Val whitening loss: {whitening_loss:.4f}")			
+				print(f"Val correlation loss: {correlation_loss:.4f}, Val whitening loss: {whitening_loss:.4f}")	
+
+				correlation_val_losses.append(correlation_loss)
+				whitening_val_losses.append(whitening_loss)	
+
+			# saving model checkpoints and performance info
+
+			if save_checkpoints and save_all_checkpoints:
+				torch.save(
+					self.model.state_dict(), os.path.join(save_path, f"epoch_{epoch}.pt"))
 
 			if val_loss < min_loss:
 				min_loss = val_loss
+				if save_checkpoints and not save_all_checkpoints:
+						torch.save(
+							self.model.state_dict(), os.path.join(save_path, f"epoch_{epoch}.pt"))
 
-				torch.save(self.model.state_dict(), os.path.join(save_path, f"epoch_{epoch}.pt"))
+			metrics = {
+			
+				"train_perplexity": train_perplexities,
+				"val_perplexity": val_perplexities,
+				"cross_entropy_train_loss": cross_entropy_train_losses,
+				"cross_entropy_val_loss": cross_entropy_val_losses,
+
+				"correlation_train_loss": correlation_train_losses,
+				"correlation_val_loss": correlation_val_losses,
+				"whitening_train_loss": whitening_train_losses,
+				"whitening_val_loss": whitening_val_losses
+			}
+
+			with open(
+				os.path.join(save_path, "metrics.json"), "w") as json_file:
+				json.dump(metrics, json_file)
+
 
 		return self.model
 

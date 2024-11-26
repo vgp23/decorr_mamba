@@ -1,10 +1,11 @@
 import torch
 import pickle
-from utils.helpers import MambaArgs, TrainingArgs, DefaultArgs, LanguageDatasetMaker
 from torch.utils.data import DataLoader
-from model.mamba import Mamba 
-from utils.trainer import MambaTrainer
-from model.decorrelation import DecorrMamba
+
+from decorr_mamba.utils.helpers import MambaArgs, TrainingArgs, DefaultArgs, LanguageDatasetMaker
+from decorr_mamba.model.decorrelation import DecorrMamba
+from decorr_mamba.utils.trainer import MambaTrainer
+
 
 
 if __name__ == "__main__":
@@ -14,7 +15,7 @@ if __name__ == "__main__":
 
 	# train on song lyrics dataset for now
 	print("Loading dataset")
-	with open("../../kaggle_song_lyrics_dataset/kaggle_song_lyrics_dataset.pkl", "rb") as f:
+	with open("../datasets/kaggle_song_lyrics_dataset/kaggle_song_lyrics_dataset.pkl", "rb") as f:
 	    seqs = pickle.load(f)
 	print("Dataset loaded")
 
@@ -28,14 +29,14 @@ if __name__ == "__main__":
 	mamba_args = MambaArgs(N, D, n_layers=2)
 
 	print("Creating model")
-	decorr_model = DecorrMamba("patch", mamba_args, 
-		sample_frac=1.0, kappa=0.5, decorr_lr=0.001)
+	decorr_model = DecorrMamba("channel_independent", mamba_args, 
+		sample_frac=1.0, kappa=0.5, decorr_lr=0.002)
 
 
 	# defining the training protocol
 	default_train_args = DefaultArgs()
 	train_args = TrainingArgs(
-	    n_epochs=20, L=L, B=B, lr=5*1.5e-3, **default_train_args.lm_args, warmup_epochs=0)
+	    n_epochs=20, L=L, B=B, lr=1*1.5e-3, **default_train_args.lm_args, warmup_epochs=0)
 	print(f"Training with following training arguments\n{train_args}")
 
 	datasets = LanguageDatasetMaker(seqs, mamba_args, train_args, total_dataset_frac=0.001,
@@ -47,4 +48,4 @@ if __name__ == "__main__":
 
 	trainer = MambaTrainer(mamba_args, train_args, decorr_model)
 
-	trainer.train(train_loader, val_loader)
+	trainer.train(train_loader, val_loader, save_checkpoints=False)
