@@ -8,6 +8,7 @@ from decorr_mamba.model.decorrelation import DecorrMamba
 from decorr_mamba.utils.trainer import MambaTrainer
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+GPU = 0
 
 
 if __name__ == "__main__":
@@ -28,7 +29,7 @@ if __name__ == "__main__":
 	D = 16
 	N = 8
 
-	device = 'cpu' # hehe 
+	device = torch.device(f'cuda:{GPU}' if torch.cuda.is_available() else 'cpu')
 	print(f"Using device: {device}")
 	mamba_args = MambaArgs(N, D, n_layers=2, device=device)
 

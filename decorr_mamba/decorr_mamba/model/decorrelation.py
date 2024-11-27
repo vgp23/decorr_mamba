@@ -22,8 +22,7 @@ class DecorrLoss(nn.Module):
 	def __init__(self):
 		super(DecorrLoss, self).__init__()
 
-
-	def forward(self, x, kappa: float, compute_grad: bool = True, 
+	def forward(self, x, kappa: float, model_args: MambaArgs, compute_grad: bool = True, 
 		compute_loss: bool = True, batched: bool = False):
 
 		"""
@@ -44,6 +43,8 @@ class DecorrLoss(nn.Module):
 				losses (correlation and whitening). Defaults to `True`.
 			batchde (bool, optional): If 'True' computes losses and gradients
 				for a batch of decorrelation matrices at once. Defaults to 'False'
+			model_args (MambaArgs): args used to define the model. Used to access
+				the current model's device. 
 
 		Returns:
 			Tuple[torch.Tensor or None, float or None, float or None]:
@@ -86,7 +87,7 @@ class DecorrLoss(nn.Module):
 
 			# compute the individual loss elements
 			D = torch.diag_embed(x**2)
-			V = D - torch.eye(d)
+			V = D - torch.eye(d, device=model_args.device)
 
 			xx_t = einsum(x, x, 'b x, b x_t -> b x x_t')
 
@@ -128,7 +129,7 @@ class DecorrLoss(nn.Module):
 
 			# compute the individual loss elements
 			D = torch.diag_embed(x**2)
-			V = D - torch.eye(conv_1d_size)
+			V = D - torch.eye(conv_1d_size, device=model_args.device)
 
 			xx_t = einsum(x, x, 
 				'd all_samples x, d all_samples x_t -> d all_samples x x_t')
@@ -209,7 +210,8 @@ class DecorrLinear(nn.Module):
 			gradients are computed.
 
 	"""
-	def __init__(self, original_layer: nn.Module, fuse: bool=True, **kwargs):
+	def __init__(self, original_layer: nn.Module, model_args: MambaArgs, 
+		fuse: bool=True, **kwargs):
 		"""
 		Initializes the DecorrLinear with a decorrelation matrix.
 
@@ -226,6 +228,7 @@ class DecorrLinear(nn.Module):
 		super(DecorrLinear, self).__init__()
 
 		self.original_layer = original_layer
+		self.model_args = model_args
 		# a layer of the same dimensions as the original, with no biases.
 		# gradients are computed outside of the backward pass
 		self.decorr_layer = nn.Parameter(
@@ -285,7 +288,7 @@ class DecorrLinear(nn.Module):
 				selected_decorr = selected @ self.decorr_layer.T
 
 				grad, correlation_loss, whitening_loss = self.loss(
-					selected_decorr, self.kappa, 
+					selected_decorr, self.kappa, self.model_args,
 					compute_grad=self.compute_grad, compute_loss=self.compute_loss)
 
 				self.correlation_loss += correlation_loss
@@ -354,7 +357,7 @@ class DecorrConv1d(DecorrLinear):
 			AssertionError: If `mode` is not `"token"` or `"patch"`.
 		"""
 		super(DecorrConv1d, self).__init__(
-			original_layer=original_layer, fuse=fuse, **kwargs)
+			original_layer=original_layer, fuse=fuse, model_args=model_args, **kwargs)
 
 		self.model_args = model_args
 		self.mode = mode
@@ -495,7 +498,8 @@ class DecorrConv1d(DecorrLinear):
 					selected_decorr = selected @ self.decorr_layer.T
 
 					grad, correlation_loss, whitening_loss = self.loss(
-						selected_decorr, self.kappa, self.compute_grad, self.compute_loss)
+						selected_decorr, self.kappa, self.model_args,
+						self.compute_grad, self.compute_loss)
 
 					self.correlation_loss += correlation_loss
 					self.whitening_loss += whitening_loss
@@ -547,7 +551,8 @@ class DecorrConv1d(DecorrLinear):
 					selected_decorr = x_unfolded[batch_idx, sample_idx] @ self.decorr_layer.T
 
 					grad, correlation_loss, whitening_loss = self.loss(
-						selected_decorr, self.kappa, self.compute_grad, self.compute_loss)
+						selected_decorr, self.kappa, self.model_args,
+						self.compute_grad, self.compute_loss)
 
 					self.correlation_loss += correlation_loss
 					self.whitening_loss += whitening_loss
@@ -615,7 +620,8 @@ class DecorrConv1d(DecorrLinear):
 					selected_decorr = selected @ self.decorr_layer.T
 
 					grad, correlation_loss, whitening_loss = self.loss(
-						selected_decorr, self.kappa, self.compute_grad, self.compute_loss)
+						selected_decorr, self.kappa, self.model_args,
+						self.compute_grad, self.compute_loss)
 
 					self.correlation_loss += correlation_loss
 					self.whitening_loss += whitening_loss
@@ -687,7 +693,7 @@ class DecorrConv1d(DecorrLinear):
 						'd conv_1d_size dummy, b n_samples d dummy -> b n_samples d conv_1d_size')
 
 					grad, correlation_loss, whitening_loss = self.loss(
-						selected_decorr, self.kappa, 
+						selected_decorr, self.kappa, self.model_args,
 						compute_grad=self.compute_grad, compute_loss=self.compute_loss,
 						batched=True)
 
@@ -809,7 +815,8 @@ class DecorrMamba(Mamba):
 			for name, child in module.named_children():
 				if name == "in_proj" or name == "out_proj" or name == "to_BCdelta":
 					setattr(module, name, DecorrLinear(
-						child, kappa=kappa, sample_frac=sample_frac, fuse=fuse))
+						child, kappa=kappa, model_args = model_args,
+						sample_frac=sample_frac, fuse=fuse))
 
 				if name == "conv1d":
 					setattr(module, name, DecorrConv1d(
