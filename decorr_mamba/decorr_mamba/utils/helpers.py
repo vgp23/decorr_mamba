@@ -6,6 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt 
 import torch  
 from transformers import AutoTokenizer
+from collections import Counter
 
 
 class DefaultArgs:
@@ -113,7 +114,7 @@ class MambaArgs:
 	D: int # dimensionality of token embeddings
 	n_layers: int
 	vocab_size: int = 50257 # GPT2 tokenizer default
-	assert vocab_size <= 50257, "Vocab size exceeds maximum of GPT2 tokenier"
+	assert vocab_size <= 50257, "Vocab size exceeds maximum of GPT2 tokenizer"
 	pad_vocab_size_multiple: int = 8
 	device: str = "cuda" if torch.cuda.is_available() else "cpu"
 	expansion_factor: int = 2 # input embeddings are upscaled by this factor
@@ -138,7 +139,10 @@ class MambaArgs:
 		if self.delta_rank == "auto":
 			self.delta_rank = math.ceil(self.D/16)
 
-		# padding vocab size to be a nice number for parallel processing
+		# padding vocab size to be a nice number for parallel processing. If using
+		# the full vocab size of the tokenizer, we pad with extra tokens that are
+		# never used. If using smaller than the full vocab size, whatever number the
+		# user inputs will be rounded up to a nice value
 		if self.vocab_size % self.pad_vocab_size_multiple != 0:
 			self.vocab_size += (self.pad_vocab_size_multiple
 								- self.vocab_size % self.pad_vocab_size_multiple)
@@ -222,7 +226,7 @@ class LanguageDatasetMaker:
 
 
 		self.tokenizer = AutoTokenizer.from_pretrained('EleutherAI/gpt-neox-20b', 
-			clean_up_tokenization_spaces=True)
+			clean_up_tokenization_spaces=True, unk_token="<|unk|>")
 
 
 		self.train_split = train_split
@@ -247,55 +251,72 @@ class LanguageDatasetMaker:
 	def _create_dataset(self, raw_dataset):
 		''' Creates a PyTorch-compatible SeqDataset from the raw data''' 
 
+		# shorten if necessary
+		if self.total_dataset_frac < 1.0:
+			raw_dataset = raw_dataset[:int(self.total_dataset_frac*(len(raw_dataset)))]
+
 		# get tokens and corresponding IDs
 		tokens = [self.tokenizer.tokenize(word) for word in raw_dataset]
 		token_ids = [self.tokenizer.convert_tokens_to_ids(token) for token in tokens]
-
-		# flattening them all in one list
 		token_ids = [item for sublist in token_ids for item in sublist] 
 
-		# shorten if necessary
-		if self.total_dataset_frac < 1.0:
-			token_ids = token_ids[:int(self.total_dataset_frac*(len(token_ids)))]
+		# filter tokens if we're working with fewer than the max vocab size
+		if self.model_args.vocab_size < 50264:  # NB this is after padding vocab size!
 
-		# limit all tokens to the top n most common. Replace the less common occurrences
-		# with unk token 
-		filtered_ids = []
-		unk_id = self.tokenizer.get_vocab()['unk']
-		# if given vocab size is not large enough to include the unk token itself, 
-		# the vocab size must be reduced by 1 to fit this in
-		if unk_id > self.model_args.vocab_size-1:
-			vocab_limit = self.model_args.vocab_size-2
+			# get the id of the unk token so we can replace all too-infrequent tokens
+			# with it
+			unk_token_id = self.tokenizer.convert_tokens_to_ids('<|unk|>')
+
+			# find the top n most common tokens. Minus one because we want to leave
+			# room for the unk token in the final vocabulary
+			counter = Counter(token_ids)
+			most_common = counter.most_common(self.model_args.vocab_size-1)
+			# just want the items, not the counts
+			most_common = [item for item, count in most_common]
+
+			# replace all tokens in the original list that are not in most_common
+			# with the unk token (possibly including the unk token itself)
+			token_ids = [
+				token_id if token_id in most_common else unk_token_id for token_id in token_ids]
+
+			# rescale the IDs to be within range of 0:vocab_size-1, and keep track of this 
+			# dictionary to translate model output after training.
+			token_dict = dict(
+				zip(most_common, 
+					list(np.arange(0,len(most_common)))
+					))
+			token_dict[unk_token_id] = self.model_args.vocab_size
+
+			if len(most_common) < self.model_args.vocab_size-1:
+				print("Minimum vocab size of the dataset (including <|unk|>):" +\
+					f" {len(most_common)}, can shrink further!")
+
+			token_ids = [token_dict[token_id] for token_id in token_ids]
+
+
 		else:
-			vocab_limit = self.model_args.vocab_size-1
+			token_dict = None
 
-		for token_id in token_ids:
-			# filter the text to only include top n most common words
-			if token_id > vocab_limit and token_id != unk_id:
-				filtered_ids.append(unk_id)
-			else:
-				filtered_ids.append(token_id)
 
-		del token_ids 
 
 		# put everything in Datasets and return
 		train_set = SeqDataset(
 			self.model_args.device, 
 			self.train_args.L, 
-			filtered_ids[:int(self.train_split * len(filtered_ids))])
+			token_ids[:int(self.train_split * len(token_ids))])
 
 		val_set   = SeqDataset(
 			self.model_args.device, 
 			self.train_args.L, 
-			filtered_ids[int(self.train_split * len(filtered_ids)) + 1:
-				int((self.train_split+self.val_split) * len(filtered_ids))])
+			token_ids[int(self.train_split * len(token_ids)) + 1:
+				int((self.train_split+self.val_split) * len(token_ids))])
 
 		# whatever is left over from the training and validation splits
 		# becomes the testing dataset
 		test_set  = SeqDataset(
 			self.model_args.device, 
 			self.train_args.L, 
-			filtered_ids[int((self.train_split+self.val_split) * len(filtered_ids)) + 1:])
+			token_ids[int((self.train_split+self.val_split) * len(token_ids)) + 1:])
 
 		return train_set, val_set, test_set
 

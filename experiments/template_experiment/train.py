@@ -33,7 +33,7 @@ if __name__ == "__main__":
 
 	device = torch.device(f'cuda:{GPU}' if torch.cuda.is_available() else 'cpu')
 	print(f"Using device: {device}")
-	mamba_args = MambaArgs(N, D, n_layers=2, device=device, vocab_size=2047)
+	mamba_args = MambaArgs(N, D, n_layers=2, device=device, vocab_size=1024)
 
 	print("Creating model...")
 	decorr_model = DecorrMamba("channel_independent", mamba_args, 
@@ -47,7 +47,7 @@ if __name__ == "__main__":
 	print(f"Training with following training arguments:\n{train_args}")
 
 	# datasets sent to the device specified in mamba_args by default 
-	datasets = LanguageDatasetMaker(seqs, mamba_args, train_args, total_dataset_frac=0.1,
+	datasets = LanguageDatasetMaker(seqs, mamba_args, train_args, total_dataset_frac=0.001,
 	                                train_split=0.8, val_split=0.2)
 
 	# creating datasets + trainer
