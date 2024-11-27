@@ -285,7 +285,7 @@ class LanguageDatasetMaker:
 				zip(most_common, 
 					list(np.arange(0,len(most_common)))
 					))
-			token_dict[unk_token_id] = self.model_args.vocab_size
+			token_dict[unk_token_id] = self.model_args.vocab_size-1
 
 			if len(most_common) < self.model_args.vocab_size-1:
 				print("Minimum vocab size of the dataset (including <|unk|>):" +\
