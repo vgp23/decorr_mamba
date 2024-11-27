@@ -10,6 +10,6 @@ python train.py > "logs/output_$timestamp.log" 2>&1
 
 conda deactivate
 
-
+# just a comment
 
 
