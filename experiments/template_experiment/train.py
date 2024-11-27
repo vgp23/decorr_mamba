@@ -29,11 +29,12 @@ if __name__ == "__main__":
 	N = 8
 
 	device = 'cpu' # hehe 
-	mamba_args = MambaArgs(N, D, n_layers=2)
+	print(f"Using device: {device}")
+	mamba_args = MambaArgs(N, D, n_layers=2, device=device)
 
 	print("Creating model...")
 	decorr_model = DecorrMamba("channel_independent", mamba_args, 
-		sample_frac=1.0, kappa=0.5, decorr_lr=0.002)
+		sample_frac=1.0, kappa=0.5, decorr_lr=0.002).to(device)
 	print("Model created.")
 
 
@@ -43,6 +44,7 @@ if __name__ == "__main__":
 	    n_epochs=20, L=L, B=B, lr=1*1.5e-3, **default_train_args.lm_args, warmup_epochs=0)
 	print(f"Training with following training arguments:\n{train_args}")
 
+	# datasets sent to the device specified in mamba_args by default 
 	datasets = LanguageDatasetMaker(seqs, mamba_args, train_args, total_dataset_frac=0.001,
 	                                train_split=0.5, val_split=0.5)
 
