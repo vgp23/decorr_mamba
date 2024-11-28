@@ -156,7 +156,7 @@ dmypy.json
 
 decorr_mamba/decorr_mamba.egg-info/
 **/checkpoints/
-
+/experiments/
 
 # Cython debug symbols
 cython_debug/

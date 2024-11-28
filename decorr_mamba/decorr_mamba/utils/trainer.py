@@ -252,19 +252,28 @@ class MambaTrainer:
 				if save_checkpoints and not save_all_checkpoints:
 						torch.save(
 							self.model.state_dict(), os.path.join(save_path, f"epoch_{epoch}.pt"))
+						
+			if isinstance(self.model, DecorrMamba):
+				metrics = {
+				
+					"train_perplexity": train_perplexities,
+					"val_perplexity": val_perplexities,
+					"cross_entropy_train_loss": cross_entropy_train_losses,
+					"cross_entropy_val_loss": cross_entropy_val_losses,
 
-			metrics = {
-			
-				"train_perplexity": train_perplexities,
-				"val_perplexity": val_perplexities,
-				"cross_entropy_train_loss": cross_entropy_train_losses,
-				"cross_entropy_val_loss": cross_entropy_val_losses,
-
-				"correlation_train_loss": correlation_train_losses,
-				"correlation_val_loss": correlation_val_losses,
-				"whitening_train_loss": whitening_train_losses,
-				"whitening_val_loss": whitening_val_losses
-			}
+					"correlation_train_loss": correlation_train_losses,
+					"correlation_val_loss": correlation_val_losses,
+					"whitening_train_loss": whitening_train_losses,
+					"whitening_val_loss": whitening_val_losses
+				}
+			else:
+				metrics = {
+				
+					"train_perplexity": train_perplexities,
+					"val_perplexity": val_perplexities,
+					"cross_entropy_train_loss": cross_entropy_train_losses,
+					"cross_entropy_val_loss": cross_entropy_val_losses
+				}				
 
 			with open(
 				os.path.join(save_path, "metrics.json"), "w") as json_file:
