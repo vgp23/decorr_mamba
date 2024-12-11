@@ -5,6 +5,7 @@ import torch.nn as nn
 from tqdm import tqdm 
 import os
 import json
+import wandb
 
 from ..utils.helpers import MambaArgs, TrainingArgs
 from ..model.mamba import Mamba
@@ -17,6 +18,7 @@ class MambaTrainer:
 			mamba_args (MambaArgs): model specification
 			train_args (TrainingArgs): training protocol specification
 			model (Mamba): implementation of Mamba architecture as per mamba_args
+			device (str): device on which to train
 
 		Attributes:
 			mamba_args (MambaArgs)
@@ -29,11 +31,12 @@ class MambaTrainer:
 				training and validation datasets
 	'''
 	def __init__(self, 
-			mamba_args: MambaArgs, train_args: TrainingArgs, model: Mamba):
+			mamba_args: MambaArgs, train_args: TrainingArgs, model: Mamba, device: str):
 
 		self.mamba_args = mamba_args
 		self.train_args = train_args
 		self.model = model
+		self.device = device
 
 
 		def _add_param_to_groups(module, param_groups):
@@ -123,19 +126,20 @@ class MambaTrainer:
 		os.makedirs(save_path, exist_ok=True)
 
 		# tracks losses across each epoch
-		cross_entropy_train_losses = []
+		train_ce_losses = []
 		train_perplexities = []
-		cross_entropy_val_losses = []	
+		val_ce_losses = []	
 		val_perplexities = []
 
 		if isinstance(self.model, DecorrMamba):	
-			correlation_train_losses = []
-			whitening_train_losses = []
+			train_corr_losses = []
+			train_whit_losses = []
 
-			correlation_val_losses = []
-			whitening_val_losses = []
+			val_corr_losses = []
+			val_whit_losses = []
 
-
+		# needed for mixed precision training
+		scaler = torch.amp.GradScaler(self.device.type)
 
 		for epoch in range(self.train_args.n_epochs):
 			print(f"Epoch: {epoch + 1}/{self.train_args.n_epochs}")
@@ -146,7 +150,6 @@ class MambaTrainer:
 				# resets gradients and losses of decorrelation matrices
 				self.model.reset_decorr_layers()
 
-
 			train_loss = 0.0
 		
 			for in_seq, target_seq in tqdm(train_loader):
@@ -155,13 +158,19 @@ class MambaTrainer:
 					# sets decorrelation matrix gradients to 0
 					self.model.reset_decorr_grad()
 
-				out_seq = self.model(in_seq)
-				loss = criterion(out_seq.view(-1, self.mamba_args.vocab_size), target_seq.view(-1))
+				# automatic mixed precision
+				with torch.amp.autocast(self.device.type):
+					out_seq = self.model(in_seq.to(self.device, non_blocking=True))
+
+					loss = criterion(
+						out_seq.view(-1, self.mamba_args.vocab_size), 
+						target_seq.to(self.device, non_blocking=True).view(-1))				
+				
 				train_loss += loss.item()
 
 				if backprop:
 					optimizer.zero_grad()
-					loss.backward()	
+					scaler.scale(loss).backward()
 
 				# gradient clipping
 				if self.train_args.gradient_clip is not None:
@@ -169,13 +178,14 @@ class MambaTrainer:
 												   self.train_args.gradient_clip)
 
 				if backprop:
-					optimizer.step()
+					scaler.step(optimizer)
+					scaler.update()
 
 				# update the decorrelation matrices AFTER standard backprop, else training breaks!
 				if isinstance(self.model, DecorrMamba):
 					# gradients internally computed during forward pass
 					self.model.update_decorr_matrices()		
-
+ 
 				if self.train_args.use_lr_sched:
 					# doesn't affect decorrelation lr
 					scheduler.step()
@@ -184,8 +194,12 @@ class MambaTrainer:
 			train_perplexity = math.exp(train_loss)
 			print(f"Train loss: {train_loss:.4f}, Train perplexity: {train_perplexity:.4f}")
 
-			cross_entropy_train_losses.append(train_loss)
+			train_ce_losses.append(train_loss)
 			train_perplexities.append(train_perplexity)
+			wandb.log(
+				{"train_ce_loss": train_loss, 
+	 			 "train_perplex": train_perplexity,
+				 "epoch": epoch + 1})
 
 			if isinstance(self.model, DecorrMamba):
 				# epoch losses are summed automatically for each decorrelation layer within the model.
@@ -200,8 +214,12 @@ class MambaTrainer:
 				print(
 					f"Train correlation loss: {correlation_loss:.4f}, Train whitening loss: {whitening_loss:.4f}")
 
-				correlation_train_losses.append(correlation_loss)
-				whitening_train_losses.append(whitening_loss)
+				train_corr_losses.append(correlation_loss)
+				train_whit_losses.append(whitening_loss)
+				wandb.log({"train_corr_loss": correlation_loss, 
+			   			   "train_whit_loss": whitening_loss,
+						   "epoch": epoch + 1})
+
 
 			# -------------------------------- validation -------------------------------------	
 
@@ -217,8 +235,12 @@ class MambaTrainer:
 
 			with torch.no_grad():
 				for in_seq, target_seq in val_loader:
-					out_seq = self.model(in_seq)
-					loss = criterion(out_seq.view(-1, self.mamba_args.vocab_size), target_seq.view(-1))
+					out_seq = self.model(in_seq.to(self.device, non_blocking=True))
+
+					loss = criterion(
+						out_seq.view(-1, self.mamba_args.vocab_size), 
+						target_seq.to(self.device, non_blocking=True).view(-1))
+					
 					val_loss += loss.item()
 
 
@@ -226,8 +248,12 @@ class MambaTrainer:
 			val_perplexity = math.exp(val_loss)
 			print(f"Val loss: {val_loss:.4f}, Val perplexity: {val_perplexity:.4f}")
 
-			cross_entropy_val_losses.append(val_loss)
+			val_ce_losses.append(val_loss)
 			val_perplexities.append(val_perplexity)
+			wandb.log({
+				"val_ce_loss": val_loss, 
+				"val_perplex": val_perplexity,
+				"epoch": epoch + 1})
 
 			if isinstance(self.model, DecorrMamba):
 				self.model.sum_decorr_losses()			
@@ -238,8 +264,12 @@ class MambaTrainer:
 				whitening_loss = total_whitening_loss / len(train_loader)
 				print(f"Val correlation loss: {correlation_loss:.4f}, Val whitening loss: {whitening_loss:.4f}")	
 
-				correlation_val_losses.append(correlation_loss)
-				whitening_val_losses.append(whitening_loss)	
+				val_corr_losses.append(correlation_loss)
+				val_whit_losses.append(whitening_loss)	
+				wandb.log({
+					"val_corr_loss": correlation_loss, 
+					"val_whit_loss": whitening_loss,
+					"epoch": epoch + 1})
 
 			# saving model checkpoints and performance info
 
@@ -256,23 +286,23 @@ class MambaTrainer:
 			if isinstance(self.model, DecorrMamba):
 				metrics = {
 				
-					"train_perplexity": train_perplexities,
-					"val_perplexity": val_perplexities,
-					"cross_entropy_train_loss": cross_entropy_train_losses,
-					"cross_entropy_val_loss": cross_entropy_val_losses,
+					"train_perplex": train_perplexities,
+					"val_perplex": val_perplexities,
+					"train_ce_loss": train_ce_losses,
+					"val_ce_loss": val_ce_losses,
 
-					"correlation_train_loss": correlation_train_losses,
-					"correlation_val_loss": correlation_val_losses,
-					"whitening_train_loss": whitening_train_losses,
-					"whitening_val_loss": whitening_val_losses
+					"train_corr_loss": train_corr_losses,
+					"val_corr_loss": val_corr_losses,
+					"train_whit_loss": train_whit_losses,
+					"val_whit_loss": val_whit_losses
 				}
 			else:
 				metrics = {
 				
-					"train_perplexity": train_perplexities,
-					"val_perplexity": val_perplexities,
-					"cross_entropy_train_loss": cross_entropy_train_losses,
-					"cross_entropy_val_loss": cross_entropy_val_losses
+					"train_perplex": train_perplexities,
+					"val_perplex": val_perplexities,
+					"train_ce_loss": train_ce_losses,
+					"val_ce_loss": val_ce_losses,
 				}				
 
 			with open(

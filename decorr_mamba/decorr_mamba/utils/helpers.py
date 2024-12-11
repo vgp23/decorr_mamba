@@ -9,39 +9,14 @@ from transformers import AutoTokenizer
 from collections import Counter
 
 
-class DefaultArgs:
-	''' Contains the default training protocols described in the Mamba paper.
-		For the synthetic datasets, values were often not given. In these cases,
-		values were copied from the language modelling protocol.'''
-
-	def __init__(self):
-		# language modelling args
-		self.lm_args = {
-			"adam_beta": (0.9, 0.95),
-			"adam_epsilon": 1e-8,
-			"gradient_clip": 1.0,
-			"weight_decay": 0.1,
-			"use_lr_sched": True,
-			"min_lr": 1e-5
-		}
-
-		# synthetic dataset modelling args
-		self.s_args = {
-			"adam_beta": (0.9, 0.95),
-			"adam_epsilon": 1e-8,
-			"gradient_clip": None,
-			"weight_decay": None,
-			"use_lr_sched": False,
-			"min_lr": None        
-		}
-
-
 
 @dataclass
 class TrainingArgs():
 	''' Contains all the arguments necessary to train a model. In case of learning schedule
 		being selected, this employs a cosine decay to a certain pre-specified limit, with a 
-		linear warmup period. Learning schedule can also be visualized before training. '''
+		linear warmup period. Learning schedule can also be visualized before training. 
+		Default values for these parameters (where applicable) can be found in the .json
+		files in the template_experiment folder.'''
 
 	n_epochs: int
 	L: int  
@@ -50,13 +25,13 @@ class TrainingArgs():
 	adam_beta: tuple 
 	adam_epsilon: float
 
-	gradient_clip: float = None
-	weight_decay: float = None
+	gradient_clip: float
+	weight_decay: float
 
 	# parameters of the learning rate schedule
-	use_lr_sched: bool = None
-	min_lr: float = None
-	warmup_epochs: int = None
+	use_lr_sched: bool
+	min_lr: float
+	warmup_epochs: int
 	
 	def __post_init__(self):
 		# NB specification in the paper uses 5x the learning rate of a comparable 
@@ -108,32 +83,38 @@ class TrainingArgs():
 
 @dataclass
 class MambaArgs:
-	''' Contains all the arguments necessary to define a Mamba model'''
+	''' 
+	Contains all the arguments necessary to define a Mamba model. Default values
+	for all of these are found in the .json files in the template_experiment folder, 
+	and are coped from the original Mamba inplementation. 
+	'''
 
 	N: int # hidden dimensionality
 	D: int # dimensionality of token embeddings
 	n_layers: int
-	vocab_size: int = 50257 # GPT2 tokenizer default
-	assert vocab_size <= 50257, "Vocab size exceeds maximum of GPT2 tokenizer"
-	pad_vocab_size_multiple: int = 8
-	device: str = "cuda" if torch.cuda.is_available() else "cpu"
-	expansion_factor: int = 2 # input embeddings are upscaled by this factor
-	conv_1d_size: int = 4
-	conv_bias: bool = True
-	general_bias: bool = False # applies to the input and output projections
+	vocab_size: int
+	pad_vocab_size_multiple: int
+	device: str
+	expansion_factor: int # input embeddings are upscaled by this factor
+	conv_1d_size: int
+	conv_bias: bool
+	general_bias: bool # applies to the input and output projections
 
 	# parameters governing how to initialize delta's
 	# relevant projection weights
-	delta_init: str = "random" # other option is "constant"
-	delta_scale: float = 1.0
-	delta_rank: Union[int, str] = 'auto'
+	delta_init: str # either "random" or "constant"
+	delta_scale: float
+	delta_rank: Union[int, str] # either "auto" or a specific number
 
 	# for the biases to the delta projection layer
-	delta_min = 0.001
-	delta_max = 0.1
-	delta_init_floor=1e-4
+	delta_min: float 
+	delta_max: float
+	delta_init_floor: float 
 
 	def __post_init__(self):
+
+		assert self.vocab_size <= 50257, "Vocab size exceeds maximum of GPT2 tokenizer"
+
 		# see discussion in paper about dimensionality of delta
 		self.D_inner = int(self.expansion_factor * self.D)
 		if self.delta_rank == "auto":
@@ -151,7 +132,6 @@ class SeqDataset(Dataset):
 	''' A simple way of creating datasets for next token prediction training
 
 		Args:
-			device (str): the device, cpu or cuda
 			seq_size (int): length of the training sequences
 			seqs (list[str]): the entire dataset expressed as a 
 				list of strings, where each list entry is a word
@@ -164,9 +144,8 @@ class SeqDataset(Dataset):
 		'''
 
 		
-	def __init__(self, device: str, seq_size: int, seqs: list[str]):
+	def __init__(self, seq_size: int, seqs: list[str]):
 		super(SeqDataset, self).__init__()
-		self.device = device
 		self.seq_size = seq_size
 		self.seqs = seqs
 
@@ -175,9 +154,9 @@ class SeqDataset(Dataset):
 
 	def __getitem__(self, idx):
 		in_seq = torch.tensor(self.seqs[idx:idx + self.seq_size], 
-			dtype=torch.long, device=self.device)
+			dtype=torch.long)
 		target_seq = torch.tensor(self.seqs[idx + 1:idx + self.seq_size + 1], 
-			dtype=torch.long, device=self.device)
+			dtype=torch.long)
 
 		return in_seq, target_seq
 
@@ -298,15 +277,12 @@ class LanguageDatasetMaker:
 			token_dict = None
 
 
-
 		# put everything in Datasets and return
 		train_set = SeqDataset(
-			self.model_args.device, 
 			self.train_args.L, 
 			token_ids[:int(self.train_split * len(token_ids))])
 
 		val_set   = SeqDataset(
-			self.model_args.device, 
 			self.train_args.L, 
 			token_ids[int(self.train_split * len(token_ids)) + 1:
 				int((self.train_split+self.val_split) * len(token_ids))])
@@ -314,7 +290,6 @@ class LanguageDatasetMaker:
 		# whatever is left over from the training and validation splits
 		# becomes the testing dataset
 		test_set  = SeqDataset(
-			self.model_args.device, 
 			self.train_args.L, 
 			token_ids[int((self.train_split+self.val_split) * len(token_ids)) + 1:])
 

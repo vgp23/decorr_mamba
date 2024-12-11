@@ -22,8 +22,8 @@ class DecorrLoss(nn.Module):
 	def __init__(self):
 		super(DecorrLoss, self).__init__()
 
-	def forward(self, x, kappa: float, model_args: MambaArgs, compute_grad: bool = True, 
-		compute_loss: bool = True, batched: bool = False):
+	def forward(self, x, kappa: float, model_args: MambaArgs, compute_grad: bool, 
+		compute_loss: bool, batched: bool):
 
 		"""
 		Computes the decorrelation gradient and/or losses for the given input tensor.
@@ -37,12 +37,12 @@ class DecorrLoss(nn.Module):
 				losses. Must be between 0 and 1, where:
 				- `kappa = 0` emphasizes decorrelation.
 				- `kappa = 1` emphasizes whitening.
-			compute_grad (bool, optional): If `True`, computes the gradient for the 
-				decorrelation matrix. Defaults to `True`.
-			compute_loss (bool, optional): If `True`, computes the decorrelation 
-				losses (correlation and whitening). Defaults to `True`.
-			batchde (bool, optional): If 'True' computes losses and gradients
-				for a batch of decorrelation matrices at once. Defaults to 'False'
+			compute_grad (bool): If `True`, computes the gradient for the 
+				decorrelation matrix. 
+			compute_loss (bool): If `True`, computes the decorrelation 
+				losses (correlation and whitening).
+			batched (bool): If 'True' computes losses and gradients
+				for a batch of decorrelation matrices at once.
 			model_args (MambaArgs): args used to define the model. Used to access
 				the current model's device. 
 
@@ -210,20 +210,26 @@ class DecorrLinear(nn.Module):
 			gradients are computed.
 
 	"""
-	def __init__(self, original_layer: nn.Module, model_args: MambaArgs, 
-		fuse: bool=True, **kwargs):
+	def __init__(self, original_layer: nn.Module, model_args: MambaArgs, fuse: bool, **kwargs):
 		"""
 		Initializes the DecorrLinear with a decorrelation matrix.
 
 		Args:
-			original_layer (nn.Module): The original linear layer to extend.
+			original_layer (nn.Module): The original linear layer to extend.				
+			fuse (bool): Controls whether the decorrelation and main layer
+				operations are fused into one transformation before being applied to the 
+				input. More efficient. 	
 			**kwargs: Additional arguments for decorrelation parameters, such as:
 				- `kappa` (float): Decorrelation gradient hyperparameter.
 				- `sample_frac` (float): Fraction of data sampled for decorrelation
 					gradient calculation.
-			fuse (bool, default=True): Controls whether the decorrelation and main layer
-				operations are fused into one transformation before being applied to the 
-				input. More efficient. 						
+				- 'use_gain_scaling' (bool): Controls whether decorrelation update steps use  
+					gain factor scaling as per Ahmad (2024)		
+				- 'use_demeaning' (bool): Controls whether de-meaning is used prior to 
+					decorrelation. Mean is computed iteratively as outlined in Ahmad (2024). 
+				- 'demeaning_lr' (float): Learning rate for the exponential moving average
+					algorithm used to compute the dataset mean, required for de-meaning.  				
+
 		"""
 		super(DecorrLinear, self).__init__()
 
@@ -241,15 +247,36 @@ class DecorrLinear(nn.Module):
 
 		self.sample_frac = kwargs.get("sample_frac")
 		self.kappa = kwargs.get("kappa")
+		self.use_gain_scaling = kwargs.get("use_gain_scaling")
+		self.use_demeaning = kwargs.get("use_demeaning")
+		self.demeaning_lr = kwargs.get("demeaning_lr")
+
+		if self.use_demeaning:
+			self.register_buffer("running_mean", torch.zeros(original_layer.weight.shape[1]))	
 
 		self.correlation_loss = 0
 		self.whitening_loss = 0
 		self.grad = None
+		self.gain_factor = None
 
 		self.loss = DecorrLoss()
 
 
 	def forward(self, x):
+
+		if self.use_demeaning: # de-mean prior to decorrelation
+			if self.compute_grad:
+				assert self.demeaning_lr is not None, "Need a demeaning_lr for training"
+
+			with torch.no_grad():
+				b, l, d = x.shape
+				x -= self.running_mean
+				# collapse across the batch and length dimensions, take
+				# mean across the resulting dimension, and use this to update
+				# the mean estimate
+				mean_update = torch.mean(x.reshape((b*l, d)), axis=0)
+				self.running_mean += self.demeaning_lr*mean_update
+
 
 		if self.fuse: # fused operation
 			y = x @ (self.original_layer.weight @ self.decorr_layer).T
@@ -289,12 +316,20 @@ class DecorrLinear(nn.Module):
 
 				grad, correlation_loss, whitening_loss = self.loss(
 					selected_decorr, self.kappa, self.model_args,
-					compute_grad=self.compute_grad, compute_loss=self.compute_loss)
+					compute_grad=self.compute_grad, compute_loss=self.compute_loss, batched=False)
 
 				self.correlation_loss += correlation_loss
 				self.whitening_loss += whitening_loss
 				# updates happen on entire network at once in training loop
 				self.grad = grad 
+
+				if self.use_gain_scaling:
+					# collapse across batch and length dimensions, then
+					# take expectations across the newly created dimension. Compute
+					# the gain vector according to equation in Appendix D of Ahmad et al. (2024)
+					self.gain_vector = torch.sqrt(
+						torch.mean((selected**2).reshape((-1, d)), axis=0) / \
+						torch.mean((selected_decorr**2).reshape((-1, d)), axis=0))
 
 		return y
 
@@ -302,9 +337,11 @@ class DecorrLinear(nn.Module):
 		self.correlation_loss = 0
 		self.whitening_loss = 0
 		self.grad = None
+		self.gain_factor = None
 
 	def reset_grad(self):
 		self.grad = None
+		self.gain_factor = None
 
 	def train(self, mode: bool = True):
 		super(DecorrLinear, self).train(mode)
@@ -313,7 +350,7 @@ class DecorrLinear(nn.Module):
 
 		if mode:
 			# allows loss to also be computed in eval mode      
-			self.compute_loss = True
+			self.compute_loss = True 
 
 
 class DecorrConv1d(DecorrLinear):
@@ -331,31 +368,39 @@ class DecorrConv1d(DecorrLinear):
 		decorr_layer (nn.Parameter): Trainable decorrelation matrix, initialized at identity.
 
 	"""
-	def __init__(self, original_layer: nn.Module, model_args: MambaArgs, mode: str = "patch", 
-		fuse: bool= True, **kwargs):
+	def __init__(self, original_layer: nn.Module, model_args: MambaArgs, mode: str, 
+		fuse: bool, **kwargs):
 		"""
 		Initializes the DecorrConv1d layer with a decorrelation matrix.
 
 		Args:
 			original_layer (nn.Module): The original convolutional layer to extend.
-			model_args (MambaArgs): Arguments for the Mamba model architecture.
-			mode (str, default="patch"): Decorrelation mode. 
+			model_args (MambaArgs): Arguments for the Mamba model architecture.		
+			mode (str): Decorrelation mode. 
 				- `"token"`: Decorrelate features of each token independently.
 				- `"patch"`: Decorrelate features across convolutional patches.
 				- `"channel_shared"`: Decorrelate features across each embedding channel
 						within every convolutional patch, using the same decorrelation
 						matrix across all channels.	
-			fuse (bool, default=True): Controls whether the decorrelation and main layer
+				- `"channel_independent"`: Decorrelate features across each embedding channel
+						within every convolutional patch, using a different decorrelation
+						matrix for each channel.							
+			fuse (bool): Controls whether the decorrelation and main layer
 				operations are fused into one transformation before being applied to the 
 				input. More efficient. 								
 			**kwargs: Additional arguments for decorrelation parameters, such as:
 				- `kappa` (float): Decorrelation gradient hyperparameter.
 				- `sample_frac` (float): Fraction of data sampled for decorrelation
 					gradient calculation.
-
+				- 'use_gain_scaling' (bool): Controls whether decorrelation update steps use  
+					gain factor scaling as per Ahmad (2024)	
+				- 'use_demeaning' (bool): Controls whether de-meaning is used prior to 
+					decorrelation. Mean is computed iteratively as outlined in Ahmad (2024). 
 		Raises:
-			AssertionError: If `mode` is not `"token"` or `"patch"`.
+			AssertionError: If `mode` is not `"token"`, `"patch"`, `"channel_independent"`
+			or `"channel_shared"`.
 		"""
+
 		super(DecorrConv1d, self).__init__(
 			original_layer=original_layer, fuse=fuse, model_args=model_args, **kwargs)
 
@@ -370,17 +415,24 @@ class DecorrConv1d(DecorrLinear):
 		if mode == "token":
 			# decorrelate each token's features independently
 			self.decorr_layer = nn.Parameter(torch.eye(model_args.D_inner), requires_grad=False)
+			if self.use_demeaning:
+				self.register_buffer("running_mean", torch.zeros(model_args.D_inner))					
 
 		elif mode == "patch":
 			# decorrelate all input features within each convolutional patch
 			self.decorr_layer = nn.Parameter(
 				torch.eye(model_args.D_inner*model_args.conv_1d_size), requires_grad=False)
+			if self.use_demeaning:
+				self.register_buffer("running_mean", 
+					torch.zeros(model_args.D_inner*model_args.conv_1d_size))					
 
 		elif mode == "channel_shared":
 			# decorrelate each patch channel's input features independently,
 			# using the same decorrelation matrix for all channels
 			self.decorr_layer = nn.Parameter(
 				torch.eye(model_args.conv_1d_size), requires_grad=False)
+			if self.use_demeaning:
+				self.register_buffer("running_mean", torch.zeros(model_args.conv_1d_size))				
 
 		else:
 			# decorrelate each patch channel's input features independently,
@@ -389,6 +441,10 @@ class DecorrConv1d(DecorrLinear):
 					model_args.D_inner, 1, 1)
 
 			self.decorr_layer = nn.Parameter(all_matrices, requires_grad=False)
+			if self.use_demeaning:
+				self.register_buffer("running_mean", 
+					torch.zeros(
+						(model_args.D_inner, model_args.conv_1d_size)))							
 
 	def forward(self, x):
 
@@ -499,12 +555,20 @@ class DecorrConv1d(DecorrLinear):
 
 					grad, correlation_loss, whitening_loss = self.loss(
 						selected_decorr, self.kappa, self.model_args,
-						self.compute_grad, self.compute_loss)
+						self.compute_grad, self.compute_loss, batched=False)
 
 					self.correlation_loss += correlation_loss
 					self.whitening_loss += whitening_loss
 					# updates happen on entire network at once in training loop
-					self.grad = grad   				      
+					self.grad = grad   				
+
+					if self.use_gain_scaling:
+						# collapse across batch and length dimensions, then
+						# take expectations across the newly created dimension. Compute
+						# the gain vector according to equation in Appendix D of Ahmad et al. (2024)
+						self.gain_vector = torch.sqrt(
+							torch.mean((selected**2).reshape((-1, d)), axis=0) / \
+							torch.mean((selected_decorr**2).reshape((-1, d)), axis=0))
 
 		# decorrelates all features in each input patch to the convolution
 		elif self.mode == "patch":
@@ -548,16 +612,26 @@ class DecorrConv1d(DecorrLinear):
 						torch.ones(b, n_patches), n_samples, replacement=False)
 					batch_idx = torch.arange(b).unsqueeze(1).expand(b, n_samples)
 
-					selected_decorr = x_unfolded[batch_idx, sample_idx] @ self.decorr_layer.T
+					selected = x_unfolded[batch_idx, sample_idx]
+
+					selected_decorr = selected @ self.decorr_layer.T
 
 					grad, correlation_loss, whitening_loss = self.loss(
 						selected_decorr, self.kappa, self.model_args,
-						self.compute_grad, self.compute_loss)
+						self.compute_grad, self.compute_loss, batched=False)
 
 					self.correlation_loss += correlation_loss
 					self.whitening_loss += whitening_loss
 					# updates happen on entire network at once in training loop
 					self.grad = grad  
+
+					if self.use_gain_scaling:
+						# collapse across batch and patch dimensions, then
+						# take expectations across the newly created dimension. Compute
+						# the gain vector according to equation in Appendix D of Ahmad et al. (2024)
+						self.gain_vector = torch.sqrt(
+							torch.mean((selected**2).reshape((-1, n_patch_features)), axis=0) / \
+							torch.mean((selected_decorr**2).reshape((-1, n_patch_features)), axis=0))  
 
 		# decorrelates each patch channel's input features independently,
 		# using the same decorrelation matrix for all channels					
@@ -621,12 +695,22 @@ class DecorrConv1d(DecorrLinear):
 
 					grad, correlation_loss, whitening_loss = self.loss(
 						selected_decorr, self.kappa, self.model_args,
-						self.compute_grad, self.compute_loss)
+						self.compute_grad, self.compute_loss, batched=False)
 
 					self.correlation_loss += correlation_loss
 					self.whitening_loss += whitening_loss
 					# updates happen on entire network at once in training loop
 					self.grad = grad
+
+					if self.use_gain_scaling:
+						# collapse across batch and embedding*n_patches dimensions, then
+						# take expectations across the newly created dimension. Compute
+						# the gain vector according to equation in Appendix D of Ahmad et al. (2024)
+						self.gain_vector = torch.sqrt(
+							torch.mean(
+								(selected**2).reshape((-1, self.model_args.conv_1d_size)), axis=0) / \
+							torch.mean(
+								(selected_decorr**2).reshape((-1, self.model_args.conv_1d_size)), axis=0))  
 
 		# decorrelates each patch channel's input features independently,
 		# using a separate decorrelation matrix for all channels	
@@ -637,6 +721,21 @@ class DecorrConv1d(DecorrLinear):
 			#(B, n_patches, D, conv_1d_size)
 			patch_matrices = x_unfolded.reshape(
 				b, -1, d, self.model_args.conv_1d_size)
+
+			if self.use_demeaning: # de-mean prior to decorrelation
+				if self.compute_grad:
+					assert self.demeaning_lr is not None, "Need a demeaning_lr for training"
+
+				with torch.no_grad():
+					# want to use the same means for each patch in each batch,
+					# broadcast the running mean to do this
+					patch_matrices -= self.running_mean.unsqueeze(0).unsqueeze(0)
+					# collapse across the batch and n_patches, take
+					# mean across the resulting dimension, and use this to update
+					# the mean estimate
+					mean_update = torch.mean(x.reshape((-1, d, self.model_args.conv_1d_size)), 
+						axis=0)
+					self.running_mean += self.demeaning_lr*mean_update
 
 			if self.fuse: # fused decorrelation and convolution
 
@@ -676,7 +775,7 @@ class DecorrConv1d(DecorrLinear):
 			if self.compute_grad or self.compute_loss:
 				with torch.no_grad():				
 					# sample fraction of each batch from which to compute loss + update.
-					b, n_patches, _, _ = patch_matrices.shape
+					b, n_patches, d, _ = patch_matrices.shape
 
 					# we sample a fixed fraction of the number of patches within each batch,
 					# and compute gradients/losses for all of the decorrelation matrices
@@ -702,6 +801,22 @@ class DecorrConv1d(DecorrLinear):
 					# updates happen on entire network at once in training loop
 					self.grad = grad 
 
+					if self.use_gain_scaling:
+						# collapse across batch and n_samples dimensions, then
+						# take expectations across the newly created dimension. Compute
+						# the gain vector according to equation in Appendix D of Ahmad et al. (2024)
+
+						# a special case; we're computing a gain_vector for each of the
+						# D decorrelation matrices in parallel. We rearrange with the D dimension
+						# first, just to be explicit about this.
+						selected = selected.permute(2,0,1,3)
+						selected_decorr = selected_decorr.permute(2,0,1,3)
+
+						self.gain_vector = torch.sqrt(
+							torch.mean(
+								(selected**2).reshape((d, -1, self.model_args.conv_1d_size)), axis=1) / \
+							torch.mean(
+								(selected_decorr**2).reshape((d, -1, self.model_args.conv_1d_size)), axis=1))
 
 		if self.original_layer.bias is not None:
 			y += self.original_layer.bias
@@ -767,7 +882,8 @@ class DecorrMamba(Mamba):
 	"""
 
 	def __init__(self,  conv_1d_mode: str, model_args: MambaArgs = None, 
-		existing_model: Mamba = None, fuse: bool = True, **kwargs):
+		existing_model: Mamba = None, fuse: bool = True, use_gain_scaling: bool = True,
+		use_demeaning: bool=True, **kwargs):
 
 		"""
 		Initializes the DecorrMamba model.
@@ -777,17 +893,23 @@ class DecorrMamba(Mamba):
 		decorrelation matrices are initialized at identity.
 
 		Args:
-			conv_1d_mode (str): The mode used for 1D convolution decorrelation layers.
+			conv_1d_mode (str): The mode used for decorrelation in Conv1d layers.
 			model_args (MambaArgs, optional): Arguments to configure a new Mamba model.
 			existing_model (Mamba, optional): Pre-existing Mamba model to modify.
+			fuse (bool, default=True): Controls whether the decorrelation and main layer
+				operations are fused into one transformation before being applied to the 
+				input. More efficient. 	
+			use_gain_scaling (bool, default=True): Controls whether decorrelation
+				update steps use gain factor scaling as per Ahmad (2024)	
+			use_demeaning (bool, default=True): Controls whether data is de-meaned
+				prior to decorrelation as per Ahmad (2024)					
 			**kwargs: Additional keyword arguments for decorrelation parameters:
 				- kappa (float): Hyperparameter for decorrelation gradient.
 				- sample_frac (float): Fraction of the data sampled for decorrelation 
 					matrix gradient calculations.
-				- decorr_lr (float): Learning rate for decorrelation updates.
-			fuse (bool, default=True): Controls whether the decorrelation and main layer
-				operations are fused into one transformation before being applied to the 
-				input. More efficient. 					
+				- decorr_lr (float): Learning rate for decorrelation updates.	
+				- demeaning_lr (float): Learning rate for EMA estimation of data means,
+					required for demeaning					
 
 		Raises:
 			AssertionError: If neither `model_args` nor `existing_model` is provided.
@@ -795,7 +917,7 @@ class DecorrMamba(Mamba):
 
 		assert existing_model is not None or model_args is not None, \
 			"Specify either a MambaArgs object to create a new model," +\
-			" or a pre-made Mamba model to modify"
+			" or a kpre-made Mamba model to modify"
 
 
 		if existing_model is not None:
@@ -807,7 +929,7 @@ class DecorrMamba(Mamba):
 			super(DecorrMamba, self).__init__(model_args)
 
 
-		def _create_decorr_matrices(module, kappa, sample_frac, conv_1d_mode, model_args, fuse):
+		def _create_decorr_matrices(module, kappa, sample_frac):
 			''' 
 			Used to recursively traverse model and create decorrelation matrices 
 			in pre-defined places
@@ -816,23 +938,23 @@ class DecorrMamba(Mamba):
 				if name == "in_proj" or name == "out_proj" or name == "to_BCdelta":
 					setattr(module, name, DecorrLinear(
 						child, kappa=kappa, model_args = model_args,
-						sample_frac=sample_frac, fuse=fuse))
+						sample_frac=sample_frac, fuse=fuse, use_gain_scaling=use_gain_scaling,
+						use_demeaning=use_demeaning, demeaning_lr=kwargs.get("demeaning_lr")))
 
 				if name == "conv1d":
 					setattr(module, name, DecorrConv1d(
-						child, model_args, conv_1d_mode, kappa=kappa, 
-						sample_frac=sample_frac, fuse=fuse))
+						original_layer=child, model_args=model_args, use_gain_scaling=use_gain_scaling,
+						use_demeaning=use_demeaning, mode=conv_1d_mode, fuse=fuse, kappa=kappa, 
+						sample_frac=sample_frac, demeaning_lr=kwargs.get("demeaning_lr")))
 
 
 		self.apply(partial(_create_decorr_matrices, 
-			kappa=kwargs.get("kappa"), sample_frac=kwargs.get("sample_frac"), 
-			conv_1d_mode=conv_1d_mode, model_args=self.model_args, fuse=fuse))
+			kappa=kwargs.get("kappa"), sample_frac=kwargs.get("sample_frac")))
 
 		# remove weight decay for decorrelation layers
 		apply_to_decorr(self, 
 			lambda decorr_module: setattr(
 				getattr(decorr_module, "decorr_layer"), "_no_weight_decay", True))
-
 
 		self.total_correlation_loss = 0
 		self.total_whitening_loss = 0
@@ -843,6 +965,7 @@ class DecorrMamba(Mamba):
 		self.conv_1d_mode = conv_1d_mode
 		self.sample_frac = kwargs.get("sample_frac")
 		self.kappa = kwargs.get("kappa")
+		self.demeaning_lr = kwargs.get("demeaning_lr")
 
 	def sum_decorr_losses(self):
 		''' 
@@ -873,8 +996,35 @@ class DecorrMamba(Mamba):
 		def _update_decorr_matrices(module):
 			for child in module.children():
 				if isinstance(child, DecorrLinear):
+
 					assert child.grad is not None, "Gradient not computed"
-					child.decorr_layer -= self.decorr_lr * child.grad @ child.decorr_layer
+
+					unscaled_update = \
+						child.decorr_layer.data - \
+						self.decorr_lr * child.grad @ child.decorr_layer.data
+
+					# gain scaling as per Ahmad (2024)
+					if child.use_gain_scaling:
+
+						# all cases are handled the same way except for conv1d layers 
+						# with "channel_independent" mode, as there are D independent
+						# decorrelation matrices to update there. Handle this first.
+						if isinstance(child, DecorrConv1d) and \
+							self.conv_1d_mode=="channel_independent":
+
+							scaled_update = einsum(child.gain_vector, unscaled_update,
+								'd out_dim, d out_dim in_dim -> d out_dim in_dim')
+
+						# all other cases are handled the following way
+						else:
+							scaled_update = einsum(child.gain_vector, unscaled_update,
+								'out_dim, out_dim in_dim -> out_dim in_dim')
+
+						child.decorr_layer.data = scaled_update
+
+					# update without gain scaling
+					else:
+						child.decorr_layer.data = unscaled_update
 
 		self.apply(_update_decorr_matrices)
 
@@ -899,7 +1049,7 @@ class DecorrMamba(Mamba):
 	def compute_decorr_losses(self, mode: bool=True):
 		"""
 		Enables or disables the computation of decorrelation losses during the 
-		forward pass. Useful for switching between training and inference modes.
+		forward pass. Useful for switching between development and pure inference modes.
 
 		Args:
 			mode (bool, default=True): If True, computes decorrelation losses; 
