@@ -29,10 +29,11 @@ class DecorrLoss(nn.Module):
 		Computes the decorrelation gradient and/or losses for the given input tensor.
 
 		Args:
-			x (torch.Tensor): Input tensor of shape (B, L, D), where:
-				- B: Batch size.
-				- L: Sequence length.
+			x (torch.Tensor): Input tensor of shape (n_samples, D) or 
+				(n_samples, D, decorr_matrix_size), where:
+				- n_samples: number of samples taken from the current batch
 				- D: Feature dimension.
+				- decorr_matrix_size: width/height of the decorrelation matrices
 			kappa (float): Regularization parameter for blending correlation and whitening 
 				losses. Must be between 0 and 1, where:
 				- `kappa = 0` emphasizes decorrelation.
@@ -67,6 +68,8 @@ class DecorrLoss(nn.Module):
 			- The losses are calculated as:
 				- Correlation Loss: Mean of the squared covariances across batches.
 				- Whitening Loss: Mean of the squared deviations of variances from identity.
+			- The only use of "batched" mode is for computing decorrelation matrix updates
+				for DecorrConv1d blocks with their decorrelation mode set to "channel_independent"
 
 		"""	
 
@@ -78,28 +81,31 @@ class DecorrLoss(nn.Module):
 		assert kappa is not None, "Specify kappa for loss and gradient computation"
 		assert kappa <= 1.0 and kappa >= 0.0, "kappa must be between 0 and 1"
 
-		# used for all modes where the decorrelation layer has only a single
-		# matrix to train 
-		if not batched:
-			# collapse across batch dimension
-			b, l, d = x.shape
-			x = x.reshape(b*l, d)
 
+
+		# used for all modes where the decorrelation layer has only a single
+		# matrix to train
+		if not batched:
+			assert len(x.shape) == 2, "Wrong input dimensionality for non-batched mode"
 			# compute the individual loss elements
+			n_samples, d = x.shape
 			D = torch.diag_embed(x**2)
 			V = D - torch.eye(d, device=model_args.device)
 
-			xx_t = einsum(x, x, 'b x, b x_t -> b x x_t')
+			xx_t = einsum(x, x, 
+				'n_samples x, n_samples x_t -> n_samples x x_t')
 
 			C = xx_t - D
 
 			if compute_loss:
-				# sum of squared covariances
+				# mean of squared covariances across matrix, then
+				# across the samples
 				correlation_loss = \
 					torch.mean(
 						torch.mean(C**2, dim=(1,2)))
 
-				# sum of squared variances
+				# mean of squared variances across matrix, then
+				# across the samples
 				whitening_loss = \
 					torch.mean(
 						torch.mean(V**2, dim=(1,2)))
@@ -119,34 +125,34 @@ class DecorrLoss(nn.Module):
 		# used where decorrelation layer has multiple matrices to train
 		# (this is the case for "channel_universal")
 		else:
-			b, n_samples, d, conv_1d_size = x.shape
+			assert len(x.shape) == 3, "Wrong input dimensionality for batched mode"
+			n_samples, d, decorr_matrix_size = x.shape
 			# in this case we're updating d matrices, each with info
-			# from one embedding dimension channel. Rearrange dimensions
-			# and collapse all samples into a single dimension. 
+			# from one embedding dimension channel.
 
-			# (D, all_samples, conv_1d_size)
-			x = x.permute(2, 0, 1, 3).reshape(d, -1, conv_1d_size)
+			# (D, all_samples, decorr_matrix_size)
+			x = x.transpose(0, 1)
 
 			# compute the individual loss elements
 			D = torch.diag_embed(x**2)
-			V = D - torch.eye(conv_1d_size, device=model_args.device)
+			V = D - torch.eye(decorr_matrix_size, device=model_args.device)
 
 			xx_t = einsum(x, x, 
-				'd all_samples x, d all_samples x_t -> d all_samples x x_t')
+				'd n_samples x, d n_samples x_t -> d n_samples x x_t')
 
-			# (D, all_samples, conv_1d_size, conv_1d_size)
+			# (D, n_samples, decorr_matrix_size, decorr_matrix_size)
 			C = xx_t - D
 
 			if compute_loss:
-				# sum of squared covariances, averaged across 
-				# all samples, then averaged across all parallel channels
+				# mean of squared covariances, averaged across each matrix,
+				# then across all samples, then across all parallel channels
 				correlation_loss = \
 					torch.mean(
 						torch.mean(
 							torch.mean(C**2, dim=(2,3)), dim=1))
 
-				# sum of squared variances, averaged across 
-				# all samples, then averaged across all parallel channels
+				# mean of squared variances, averaged across each matrix,
+				# then across all samples, then across all parallel channels
 				whitening_loss = \
 					torch.mean(
 						torch.mean(
@@ -263,19 +269,23 @@ class DecorrLinear(nn.Module):
 
 
 	def forward(self, x):
+		b, l, d = x.shape
+		# idea with de-meaning: keep a running average of the training dataset for
+		# use during inference, but de-mean during training using the batch mean
 
 		if self.use_demeaning: # de-mean prior to decorrelation
-			if self.compute_grad:
+			if self.training:
 				assert self.demeaning_lr is not None, "Need a demeaning_lr for training"
-
-			with torch.no_grad():
-				b, l, d = x.shape
-				x -= self.running_mean
-				# collapse across the batch and length dimensions, take
-				# mean across the resulting dimension, and use this to update
-				# the mean estimate
-				mean_update = torch.mean(x.reshape((b*l, d)), axis=0)
-				self.running_mean += self.demeaning_lr*mean_update
+				with torch.no_grad():
+					# collapse across the batch and length dimensions, take
+					# mean across the resulting dimension, and use this to de-mean
+					# + update the mean estimate
+					batch_mean = torch.mean(x.reshape((b*l, d)), axis=0)
+					x -= batch_mean
+					self.running_mean += self.demeaning_lr*batch_mean
+			else:
+				with torch.no_grad():
+					x -= self.running_mean
 
 
 		if self.fuse: # fused operation
@@ -303,14 +313,13 @@ class DecorrLinear(nn.Module):
 				"sample_frac must be between 0 and 1"   
 
 			with torch.no_grad():
-				b, l, d = x.shape
-				n_samples = int(self.sample_frac*l)
+				# collapse across the batch and sequence length dimension, then sample
+				# a pre-specified fraction from this
+				x = x.reshape((b*l, d))
+				n_samples = int(self.sample_frac*b*l)
+				sample_idx = torch.multinomial(torch.ones(b*l), n_samples, replacement=False)
 
-				sample_idx = torch.multinomial(
-					torch.ones(b, l), n_samples, replacement=False)
-				batch_idx = torch.arange(b).unsqueeze(1).expand(b, n_samples)
-
-				selected = x[batch_idx, sample_idx]
+				selected = x[sample_idx]
 
 				selected_decorr = selected @ self.decorr_layer.T
 
@@ -324,12 +333,11 @@ class DecorrLinear(nn.Module):
 				self.grad = grad 
 
 				if self.use_gain_scaling:
-					# collapse across batch and length dimensions, then
-					# take expectations across the newly created dimension. Compute
-					# the gain vector according to equation in Appendix D of Ahmad et al. (2024)
+					# take expectations across all samples. Compute the gain vector according 
+					# to equation in Appendix D of Ahmad et al. (2024)
 					self.gain_vector = torch.sqrt(
-						torch.mean((selected**2).reshape((-1, d)), axis=0) / \
-						torch.mean((selected_decorr**2).reshape((-1, d)), axis=0))
+						torch.mean((selected**2), axis=0) / \
+						(torch.mean((selected_decorr**2), axis=0)) + 1e-08)
 
 		return y
 
@@ -568,7 +576,7 @@ class DecorrConv1d(DecorrLinear):
 						# the gain vector according to equation in Appendix D of Ahmad et al. (2024)
 						self.gain_vector = torch.sqrt(
 							torch.mean((selected**2).reshape((-1, d)), axis=0) / \
-							torch.mean((selected_decorr**2).reshape((-1, d)), axis=0))
+							(torch.mean((selected_decorr**2).reshape((-1, d)), axis=0)) + 1e-08)
 
 		# decorrelates all features in each input patch to the convolution
 		elif self.mode == "patch":
@@ -631,7 +639,7 @@ class DecorrConv1d(DecorrLinear):
 						# the gain vector according to equation in Appendix D of Ahmad et al. (2024)
 						self.gain_vector = torch.sqrt(
 							torch.mean((selected**2).reshape((-1, n_patch_features)), axis=0) / \
-							torch.mean((selected_decorr**2).reshape((-1, n_patch_features)), axis=0))  
+							(torch.mean((selected_decorr**2).reshape((-1, n_patch_features)), axis=0)) + 1e-08)
 
 		# decorrelates each patch channel's input features independently,
 		# using the same decorrelation matrix for all channels					
@@ -709,33 +717,32 @@ class DecorrConv1d(DecorrLinear):
 						self.gain_vector = torch.sqrt(
 							torch.mean(
 								(selected**2).reshape((-1, self.model_args.conv_1d_size)), axis=0) / \
-							torch.mean(
-								(selected_decorr**2).reshape((-1, self.model_args.conv_1d_size)), axis=0))  
+							(torch.mean(
+								(selected_decorr**2).reshape((-1, self.model_args.conv_1d_size)), axis=0)) + 1e-08)
 
 		# decorrelates each patch channel's input features independently,
 		# using a separate decorrelation matrix for all channels	
 		else:
-			# represent each patch as a matrix, with embedding channels grouped
-			# in the last dimension
+			# represent each patch as a matrix
 
 			#(B, n_patches, D, conv_1d_size)
 			patch_matrices = x_unfolded.reshape(
 				b, -1, d, self.model_args.conv_1d_size)
 
 			if self.use_demeaning: # de-mean prior to decorrelation
-				if self.compute_grad:
+				if self.training:
 					assert self.demeaning_lr is not None, "Need a demeaning_lr for training"
-
-				with torch.no_grad():
-					# want to use the same means for each patch in each batch,
-					# broadcast the running mean to do this
-					patch_matrices -= self.running_mean.unsqueeze(0).unsqueeze(0)
-					# collapse across the batch and n_patches, take
-					# mean across the resulting dimension, and use this to update
-					# the mean estimate
-					mean_update = torch.mean(x.reshape((-1, d, self.model_args.conv_1d_size)), 
-						axis=0)
-					self.running_mean += self.demeaning_lr*mean_update
+					with torch.no_grad():
+						# collapse across the batch and n_patches, take
+						# mean across the resulting dimension, and use this to de-mean
+						# + update the mean estimate
+						batch_mean = torch.mean(x.reshape((-1, d, self.model_args.conv_1d_size)), 
+							axis=0)
+						patch_matrices -= batch_mean.unsqueeze(0).unsqueeze(0)
+						self.running_mean += self.demeaning_lr*batch_mean
+				else:
+					with torch.no_grad():
+						patch_matrices -= self.running_mean.unsqueeze(0).unsqueeze(0)			
 
 			if self.fuse: # fused decorrelation and convolution
 
@@ -774,22 +781,19 @@ class DecorrConv1d(DecorrLinear):
 
 			if self.compute_grad or self.compute_loss:
 				with torch.no_grad():				
-					# sample fraction of each batch from which to compute loss + update.
-					b, n_patches, d, _ = patch_matrices.shape
+					# sample fraction of the batch from which to compute loss + update.
+					# first collapse across batch and n_patches dimension
+					patch_matrices = patch_matrices.reshape(-1, d, self.model_args.conv_1d_size)
 
-					# we sample a fixed fraction of the number of patches within each batch,
-					# and compute gradients/losses for all of the decorrelation matrices
-					# using each sample
-					n_samples = int(self.sample_frac*n_patches)
+					n_samples = int(self.sample_frac*patch_matrices.shape[0])
 
-					sample_idx = torch.multinomial(
-						torch.ones(b, n_patches), n_samples, replacement=False)
-					batch_idx = torch.arange(b).unsqueeze(1).expand(b, n_samples)
+					sample_idx = torch.multinomial(torch.ones(patch_matrices.shape[0]), 
+						n_samples, replacement=False)
 
-					selected = patch_matrices[batch_idx, sample_idx]
+					selected = patch_matrices[sample_idx]
 
 					selected_decorr = einsum(self.decorr_layer, selected,
-						'd conv_1d_size dummy, b n_samples d dummy -> b n_samples d conv_1d_size')
+						'd conv_1d_size dummy, n_samples d dummy -> n_samples d conv_1d_size')
 
 					grad, correlation_loss, whitening_loss = self.loss(
 						selected_decorr, self.kappa, self.model_args,
@@ -802,21 +806,17 @@ class DecorrConv1d(DecorrLinear):
 					self.grad = grad 
 
 					if self.use_gain_scaling:
-						# collapse across batch and n_samples dimensions, then
-						# take expectations across the newly created dimension. Compute
+						# take expectations across the sample dimension. Compute
 						# the gain vector according to equation in Appendix D of Ahmad et al. (2024)
 
 						# a special case; we're computing a gain_vector for each of the
 						# D decorrelation matrices in parallel. We rearrange with the D dimension
 						# first, just to be explicit about this.
-						selected = selected.permute(2,0,1,3)
-						selected_decorr = selected_decorr.permute(2,0,1,3)
+						selected = selected.transpose(0,1)
+						selected_decorr = selected_decorr.transpose(0,1)
 
 						self.gain_vector = torch.sqrt(
-							torch.mean(
-								(selected**2).reshape((d, -1, self.model_args.conv_1d_size)), axis=1) / \
-							torch.mean(
-								(selected_decorr**2).reshape((d, -1, self.model_args.conv_1d_size)), axis=1))
+							torch.mean(selected**2, axis=1) / (torch.mean(selected_decorr**2, axis=1)) + 1e-08)
 
 		if self.original_layer.bias is not None:
 			y += self.original_layer.bias

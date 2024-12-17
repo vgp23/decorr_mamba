@@ -260,8 +260,8 @@ class MambaTrainer:
 				total_correlation_loss = self.model.total_correlation_loss.item()
 				total_whitening_loss = self.model.total_whitening_loss.item()
 
-				correlation_loss = total_correlation_loss / len(train_loader)
-				whitening_loss = total_whitening_loss / len(train_loader)
+				correlation_loss = total_correlation_loss / len(val_loader)
+				whitening_loss = total_whitening_loss / len(val_loader)
 				print(f"Val correlation loss: {correlation_loss:.4f}, Val whitening loss: {whitening_loss:.4f}")	
 
 				val_corr_losses.append(correlation_loss)
