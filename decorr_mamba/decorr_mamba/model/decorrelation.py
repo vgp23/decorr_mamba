@@ -51,9 +51,9 @@ class DecorrLoss(nn.Module):
 			Tuple[torch.Tensor or None, float or None, float or None]:
 				- **grad** (torch.Tensor or None): Gradient tensor of shape (D, D). 
 				  Returns `None` if `compute_grad` is `False`.
-				- **correlation_loss** (float or None): Correlation loss scalar. 
+				- **corr_loss** (float or None): Correlation loss scalar. 
 				  Returns `None` if `compute_loss` is `False`.
-				- **whitening_loss** (float or None): Whitening loss scalar. 
+				- **whit_loss** (float or None): Whitening loss scalar. 
 				  Returns `None` if `compute_loss` is `False`.
 
 		Raises:
@@ -99,20 +99,20 @@ class DecorrLoss(nn.Module):
 
 			if compute_loss:
 				# mean of squared covariances across matrix, then
-				# across the samples
-				correlation_loss = \
+				# across the batch
+				corr_loss = \
 					torch.mean(
 						torch.mean(C**2, dim=(1,2)))
 
 				# mean of squared variances across matrix, then
-				# across the samples
-				whitening_loss = \
+				# across the batch
+				whit_loss = \
 					torch.mean(
 						torch.mean(V**2, dim=(1,2)))
 
 			else:
-				correlation_loss = None 
-				whitening_loss = None
+				corr_loss = None 
+				whit_loss = None
 
 			# compute the actual gradient, if applicable
 			if compute_grad:
@@ -120,7 +120,7 @@ class DecorrLoss(nn.Module):
 			else:
 				grad = None
 
-			return grad, correlation_loss, whitening_loss
+			return grad, corr_loss, whit_loss
 
 		# used where decorrelation layer has multiple matrices to train
 		# (this is the case for "channel_universal")
@@ -146,21 +146,21 @@ class DecorrLoss(nn.Module):
 			if compute_loss:
 				# mean of squared covariances, averaged across each matrix,
 				# then across all samples, then across all parallel channels
-				correlation_loss = \
+				corr_loss = \
 					torch.mean(
 						torch.mean(
 							torch.mean(C**2, dim=(2,3)), dim=1))
 
 				# mean of squared variances, averaged across each matrix,
 				# then across all samples, then across all parallel channels
-				whitening_loss = \
+				whit_loss = \
 					torch.mean(
 						torch.mean(
 							torch.mean(V**2, dim=(2,3)), dim=1))
 
 			else:
-				correlation_loss = None 
-				whitening_loss = None
+				corr_loss = None 
+				whit_loss = None
 
 			# compute the actual gradients, if applicable
 			if compute_grad:
@@ -168,7 +168,7 @@ class DecorrLoss(nn.Module):
 			else:
 				grad = None
 
-			return grad, correlation_loss, whitening_loss
+			return grad, corr_loss, whit_loss
 			
 	
 
@@ -198,18 +198,15 @@ class DecorrLinear(nn.Module):
 			are computed during the forward pass.
 		sample_frac (float): Fraction of input samples to use for loss and gradient computation.
 		kappa (float): Hyperparameter used to compute decorrelation matrix gradients.
-		correlation_loss (float): Accumulated correlation loss across batches.
-		whitening_loss (float): Accumulated whitening loss across batches.
+		corr_loss (float): Accumulated correlation loss across batches.
+		whit_loss (float): Accumulated whitening loss across batches.
 		grad (torch.Tensor or None): Gradient of the decorrelation matrix, computed 
 			during the forward pass.
 		loss (DecorrLoss): Loss function instance for computing decorrelation and whitening losses.
 
 	Methods:		
 		reset():
-			Resets accumulated losses and gradients to their initial state.
-		
-		reset_grad():
-			Resets the gradient of the decorrelation matrix only.
+			Resets losses and gradients to their initial state.
 		
 		train(mode: bool = True):
 			Enables or disables training mode for the layer. Controls whether decorrelation 
@@ -260,8 +257,8 @@ class DecorrLinear(nn.Module):
 		if self.use_demeaning:
 			self.register_buffer("running_mean", torch.zeros(original_layer.weight.shape[1]))	
 
-		self.correlation_loss = 0
-		self.whitening_loss = 0
+		self.corr_loss = 0
+		self.whit_loss = 0
 		self.grad = None
 		self.gain_factor = None
 
@@ -323,13 +320,12 @@ class DecorrLinear(nn.Module):
 
 				selected_decorr = selected @ self.decorr_layer.T
 
-				grad, correlation_loss, whitening_loss = self.loss(
+				grad, corr_loss, whit_loss = self.loss(
 					selected_decorr, self.kappa, self.model_args,
 					compute_grad=self.compute_grad, compute_loss=self.compute_loss, batched=False)
 
-				self.correlation_loss += correlation_loss
-				self.whitening_loss += whitening_loss
-				# updates happen on entire network at once in training loop
+				self.corr_loss = corr_loss
+				self.whit_loss = whit_loss
 				self.grad = grad 
 
 				if self.use_gain_scaling:
@@ -342,12 +338,8 @@ class DecorrLinear(nn.Module):
 		return y
 
 	def reset(self):
-		self.correlation_loss = 0
-		self.whitening_loss = 0
-		self.grad = None
-		self.gain_factor = None
-
-	def reset_grad(self):
+		self.corr_loss = 0
+		self.whit_loss = 0
 		self.grad = None
 		self.gain_factor = None
 
@@ -561,12 +553,12 @@ class DecorrConv1d(DecorrLinear):
 
 					selected_decorr = selected @ self.decorr_layer.T
 
-					grad, correlation_loss, whitening_loss = self.loss(
+					grad, corr_loss, whit_loss = self.loss(
 						selected_decorr, self.kappa, self.model_args,
 						self.compute_grad, self.compute_loss, batched=False)
 
-					self.correlation_loss += correlation_loss
-					self.whitening_loss += whitening_loss
+					self.corr_loss = corr_loss
+					self.whit_loss = whit_loss
 					# updates happen on entire network at once in training loop
 					self.grad = grad   				
 
@@ -624,12 +616,12 @@ class DecorrConv1d(DecorrLinear):
 
 					selected_decorr = selected @ self.decorr_layer.T
 
-					grad, correlation_loss, whitening_loss = self.loss(
+					grad, corr_loss, whit_loss = self.loss(
 						selected_decorr, self.kappa, self.model_args,
 						self.compute_grad, self.compute_loss, batched=False)
 
-					self.correlation_loss += correlation_loss
-					self.whitening_loss += whitening_loss
+					self.corr_loss = corr_loss
+					self.whit_loss = whit_loss
 					# updates happen on entire network at once in training loop
 					self.grad = grad  
 
@@ -701,12 +693,12 @@ class DecorrConv1d(DecorrLinear):
 
 					selected_decorr = selected @ self.decorr_layer.T
 
-					grad, correlation_loss, whitening_loss = self.loss(
+					grad, corr_loss, whit_loss = self.loss(
 						selected_decorr, self.kappa, self.model_args,
 						self.compute_grad, self.compute_loss, batched=False)
 
-					self.correlation_loss += correlation_loss
-					self.whitening_loss += whitening_loss
+					self.corr_loss = corr_loss
+					self.whit_loss = whit_loss
 					# updates happen on entire network at once in training loop
 					self.grad = grad
 
@@ -795,13 +787,13 @@ class DecorrConv1d(DecorrLinear):
 					selected_decorr = einsum(self.decorr_layer, selected,
 						'd conv_1d_size dummy, n_samples d dummy -> n_samples d conv_1d_size')
 
-					grad, correlation_loss, whitening_loss = self.loss(
+					grad, corr_loss, whit_loss = self.loss(
 						selected_decorr, self.kappa, self.model_args,
 						compute_grad=self.compute_grad, compute_loss=self.compute_loss,
 						batched=True)
 
-					self.correlation_loss += correlation_loss
-					self.whitening_loss += whitening_loss
+					self.corr_loss = corr_loss
+					self.whit_loss = whit_loss
 					# updates happen on entire network at once in training loop
 					self.grad = grad 
 
@@ -854,8 +846,8 @@ class DecorrMamba(Mamba):
 	- Dynamic updates to decorrelation layers during training.
 
 	Attributes:
-		total_correlation_loss (float): The total correlation loss across all decorrelation layers.
-		total_whitening_loss (float): The total whitening loss across all decorrelation layers.
+		mean_corr_loss (float): The mean correlation loss across all decorrelation layers.
+		mean_whit_loss (float): The mean whitening loss across all decorrelation layers.
 		decorr_lr (float): Learning rate for updating decorrelation matrices.
 		conv_1d_mode (str): The mode used for 1D convolution decorrelation layers. "patch"
 			decorrelates all features seen by a convolutional kernel, "token" decorrelates
@@ -865,17 +857,14 @@ class DecorrMamba(Mamba):
 			loss terms in the gradient computation, for the decorrelation amtrices
 
 	Methods:
-		sum_decorr_losses():
-			Calculates and stores the total correlation and whitening losses from all decorrelation layers.
+		mean_decorr_losses():
+			Calculates the mean correlation and whitening losses across all decorrelation layers.
 
 		update_decorr_matrices():
 			Updates decorrelation matrices for all decorrelation layers using their respective gradients.
 
-		reset_decorr_grad():
-			Resets the gradients of decorrelation matrices after a forward pass.
-
-		reset_decorr_layers():
-			Resets the gradients and losses of decorrelation layers and the total summed losses.
+		reset_decorr():
+			Resets the gradients and losses of decorrelation layers, and the model mean losses.
 
 		compute_decorr_losses(mode: bool=True):
 			Enables or disables the computation of decorrelation losses during the forward pass.
@@ -917,7 +906,7 @@ class DecorrMamba(Mamba):
 
 		assert existing_model is not None or model_args is not None, \
 			"Specify either a MambaArgs object to create a new model," +\
-			" or a kpre-made Mamba model to modify"
+			" or a pre-made Mamba model to modify"
 
 
 		if existing_model is not None:
@@ -928,6 +917,7 @@ class DecorrMamba(Mamba):
 		else:
 			super(DecorrMamba, self).__init__(model_args)
 
+		self.n_decorr_layers = 0 # used for averaging the decorr losses later
 
 		def _create_decorr_matrices(module, kappa, sample_frac):
 			''' 
@@ -936,14 +926,18 @@ class DecorrMamba(Mamba):
 			'''
 			for name, child in module.named_children():
 				if name == "in_proj" or name == "out_proj" or name == "to_BCdelta":
+					self.n_decorr_layers += 1
+					# self.model_args isn't a mistake here!
 					setattr(module, name, DecorrLinear(
-						child, kappa=kappa, model_args = model_args,
+						child, kappa=kappa, model_args=self.model_args,
 						sample_frac=sample_frac, fuse=fuse, use_gain_scaling=use_gain_scaling,
 						use_demeaning=use_demeaning, demeaning_lr=kwargs.get("demeaning_lr")))
 
 				if name == "conv1d":
+					self.n_decorr_layers += 1 
+					# self.model_args isn't a mistake here!					
 					setattr(module, name, DecorrConv1d(
-						original_layer=child, model_args=model_args, use_gain_scaling=use_gain_scaling,
+						original_layer=child, model_args=self.model_args, use_gain_scaling=use_gain_scaling,
 						use_demeaning=use_demeaning, mode=conv_1d_mode, fuse=fuse, kappa=kappa, 
 						sample_frac=sample_frac, demeaning_lr=kwargs.get("demeaning_lr")))
 
@@ -956,20 +950,15 @@ class DecorrMamba(Mamba):
 			lambda decorr_module: setattr(
 				getattr(decorr_module, "decorr_layer"), "_no_weight_decay", True))
 
-		self.total_correlation_loss = 0
-		self.total_whitening_loss = 0
+		self.mean_corr_loss = 0
+		self.mean_whit_loss = 0
 		self.decorr_lr = kwargs.get("decorr_lr")
-
-		# these are just here for reference, individual decorrelation layers
-		# take care of using these values automatically
+		
 		self.conv_1d_mode = conv_1d_mode
-		self.sample_frac = kwargs.get("sample_frac")
-		self.kappa = kwargs.get("kappa")
-		self.demeaning_lr = kwargs.get("demeaning_lr")
 
-	def sum_decorr_losses(self):
+	def mean_decorr_losses(self):
 		''' 
-		Calculates the summed total of correlation and whitening losses across all 
+		Calculates the mean correlation and whitening losses across all 
 		layers implementing decorrelation, for a Mamba model
 		'''
 
@@ -979,10 +968,13 @@ class DecorrMamba(Mamba):
 				# DecorrConv1d extends DecorrLinear, should account for 
 				# convolutional layers too
 				if isinstance(child, DecorrLinear):
-					self.total_correlation_loss += child.correlation_loss
-					self.total_whitening_loss += child.whitening_loss
+					self.mean_corr_loss += child.corr_loss
+					self.mean_whit_loss += child.whit_loss
 
 		self.apply(_sum_losses)
+
+		self.mean_corr_loss /= self.n_decorr_layers
+		self.mean_whit_loss /= self.n_decorr_layers
 
 	def update_decorr_matrices(self):
 		''' 
@@ -1028,23 +1020,15 @@ class DecorrMamba(Mamba):
 
 		self.apply(_update_decorr_matrices)
 
-	def reset_decorr_grad(self):
-		''' 
-		Resets gradients of decorrelation matrices after forward pass. 
-		Used between each minibatch update. 
-		'''
-
-		apply_to_decorr(self, lambda x: x.reset_grad())
-
-	def reset_decorr_layers(self):
+	def reset_decorr(self):
 		''' 
 		Resets gradients and losses of decorrelation layers after parameter
-		updates. Also resets the summed total losses across all decorrelation
-		layers. Used before beginning a new training epoch.
+		updates. Also resets the mean losses computed across all decorrelation
+		layers.
 		'''
 		apply_to_decorr(self, lambda x: x.reset())
-		self.total_correlation_loss = 0
-		self.total_whitening_loss = 0
+		self.mean_corr_loss = 0
+		self.mean_whit_loss = 0
 
 	def compute_decorr_losses(self, mode: bool=True):
 		"""

@@ -9,7 +9,8 @@ import wandb
 
 from ..utils.helpers import MambaArgs, TrainingArgs
 from ..model.mamba import Mamba
-from ..model.decorrelation import DecorrMamba
+from ..model.decorrelation import DecorrMamba, apply_to_decorr
+from ..data.synthetics import InductionData
 
 class MambaTrainer:
 	''' Trains a Mamba architecture according to a pre-specified configuration
@@ -38,7 +39,6 @@ class MambaTrainer:
 		self.model = model
 		self.device = device
 
-
 		def _add_param_to_groups(module, param_groups):
 			'''
 			Adds the parameters of the module to the appropriate param_groups list
@@ -64,38 +64,48 @@ class MambaTrainer:
 			# weight tying causes the embedding and output weights to be the same,
 			# but the logic above counts this parameter twice. Remove to fix.
 			del self._param_groups["decay"][-1]
-
-	def train(self, train_loader: DataLoader, val_loader: DataLoader, 
-		backprop: bool=True, save_checkpoints: bool=True, save_all_checkpoints: bool=False):
+	
+	def train_induction(self, train_data: InductionData, val_loader: DataLoader, 
+		n_epoch_steps: int, use_amp: bool, train_backprop: bool=True, train_decorr: bool=True, 
+		save_checkpoints: bool=True, save_all_checkpoints: bool=False):
 
 		''' 
 		Trains the model with the protocol specified in train_args.
 
 		Args:
-			train_loader (DataLoader): PyTorch-compatible training dataloader
+			train_data (InductionData): iterator which generates the next
+				training dataset batch
+			n_epoch_steps (int): number of steps in an "epoch". Meaningless 
+				construct since we're generating new data every time
 			val_loader (DataLoader): PyTorch-compatible validation dataloader
-			backprop (bool, optional): turns off parameter updating for everything
+			train_backprop (bool, optional): turns on parameter updating for everything
 				other than decorrelation matrices, allows for sanity check
 				of decorrelation learning rule. Defaults to 'True'
+			train_decorr(bool, optional): turns on training for decorrelation matrices.
+				Defaults to 'True'
 			save_checkpoints (bool, optional): controls whether checkpoints are saved
 				during epochs. Defaults to 'True'
 			save_all_checkpoints (bool, optional): if saving checkpoints, controls
 				whether all epoch checkpoints are saved or just those where the loss
-				is better than the previous minimum. Defaults to 'False'	
+				is better than the previous minimum. Defaults to 'False.	
+			use_amp (bool): determines if training with automatic mixed precision 
+				or not. 
 
 		'''
 
 		criterion = nn.CrossEntropyLoss()
-		if not backprop:
-			print("Warning: only training decorrelation matrices!")
+		if not train_backprop:
+			print("Warning: not training backpropagation parameters!")
+		if not train_decorr:
+			print("Warning: not training decorrelation parameters!")
+		if not isinstance(self.model, DecorrMamba) and train_decorr:
+			print("Warning: train_decorr set to True but model does not use decorrelation!")
 
 		if not save_checkpoints:
 			assert not save_all_checkpoints, \
 			"Cannot save all checkpoints, as save_checkpoints is set to False." 
 
-		# used in language modelling, usually
 		if self.train_args.weight_decay is not None:
-			# only apply decay to specific parameters
 			optimizer = torch.optim.AdamW(
 				[{'params': self._param_groups['decay'],
 				  'weight_decay': self.train_args.weight_decay}, 
@@ -106,15 +116,12 @@ class MambaTrainer:
 				  lr=self.train_args.lr,
 				  betas=self.train_args.adam_beta,
 				  eps=self.train_args.adam_epsilon)
-
-
-		else: # used in synthetic tasks
+			
+		else:
 			optimizer = torch.optim.Adam(self.model.parameters(), 
 										lr=self.train_args.lr, 
 										betas=self.train_args.adam_beta,
 										eps=self.train_args.adam_epsilon)    
-
-
 
 		if self.train_args.use_lr_sched:
 			scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -125,101 +132,93 @@ class MambaTrainer:
 		save_path = os.path.join(".", "checkpoints")
 		os.makedirs(save_path, exist_ok=True)
 
-		# tracks losses across each epoch
-		train_ce_losses = []
-		train_perplexities = []
-		val_ce_losses = []	
-		val_perplexities = []
-
-		if isinstance(self.model, DecorrMamba):	
-			train_corr_losses = []
-			train_whit_losses = []
-
-			val_corr_losses = []
-			val_whit_losses = []
-
-		# needed for mixed precision training
-		scaler = torch.amp.GradScaler(self.device.type)
+		scaler = torch.amp.GradScaler(self.device.type, enabled=use_amp)
 
 		for epoch in range(self.train_args.n_epochs):
 			print(f"Epoch: {epoch + 1}/{self.train_args.n_epochs}")
 
 			self.model.train()
 
-			if isinstance(self.model, DecorrMamba):
-				# resets gradients and losses of decorrelation matrices
-				self.model.reset_decorr_layers()
+			assert n_epoch_steps is not None, "Specify number of steps per epoch"
 
-			train_loss = 0.0
-		
-			for in_seq, target_seq in tqdm(train_loader):
+			epoch_train_ce_loss = 0.0
+			epoch_train_corr_loss = 0.0
+			epoch_train_whit_loss = 0.0
 
+			for i in tqdm(range(n_epoch_steps)):
+
+				optimizer.zero_grad()
 				if isinstance(self.model, DecorrMamba):
-					# sets decorrelation matrix gradients to 0
-					self.model.reset_decorr_grad()
-
-				# automatic mixed precision
-				with torch.amp.autocast(self.device.type):
-					out_seq = self.model(in_seq.to(self.device, non_blocking=True))
-
-					loss = criterion(
-						out_seq.view(-1, self.mamba_args.vocab_size), 
-						target_seq.to(self.device, non_blocking=True).view(-1))				
+					self.model.reset_decorr()
 				
-				train_loss += loss.item()
+				in_seq = next(train_data).to(self.device, non_blocking=True)
 
-				if backprop:
-					optimizer.zero_grad()
+				assert torch.all(in_seq >= 0) and torch.all(in_seq < 16), "Data error!"
+
+				with torch.amp.autocast(self.device.type, enabled=use_amp):
+					# only care about how well the model predicts the last token
+					# when seeing the cue
+					out_seq = self.model(in_seq[:,:-1])
+					pred = out_seq[:,-1]
+					target = in_seq[:,-1]
+					loss = criterion(pred, target)		
+
+				# del in_seq
+				# torch.cuda.empty_cache()
+
+				epoch_train_ce_loss += loss.item()
+
+				# log every 10 steps
+				if i%10 == 0:
+					wandb.log({"train_ce_loss": loss.item()})							
+											
+				if isinstance(self.model, DecorrMamba):
+					# calculating mean losses across all decorrelation layers
+					self.model.mean_decorr_losses()			
+					train_corr_loss = self.model.mean_corr_loss.item()
+					train_whit_loss = self.model.mean_whit_loss.item()
+					epoch_train_corr_loss += train_corr_loss
+					epoch_train_whit_loss += train_whit_loss
+
+					if i%10 == 0:
+						wandb.log({"train_corr_loss": train_corr_loss, 
+								"train_whit_loss": train_whit_loss})	
+
+				if train_backprop:
 					scaler.scale(loss).backward()
+				
+				for name, param in self.model.named_parameters():
+					if param.grad is not None:
+						update_ratio = torch.norm(param.grad) / torch.norm(param)
+						print(f"Layer: {name}, Update Ratio: {update_ratio.item()}")
 
 				# gradient clipping
 				if self.train_args.gradient_clip is not None:
+					scaler.unscale_(optimizer)
 					torch.nn.utils.clip_grad_norm_(self.model.parameters(), 
-												   self.train_args.gradient_clip)
+												self.train_args.gradient_clip)
 
-				if backprop:
+				if train_backprop:
 					scaler.step(optimizer)
 					scaler.update()
 
-				# update the decorrelation matrices AFTER standard backprop, else training breaks!
-				if isinstance(self.model, DecorrMamba):
-					# gradients internally computed during forward pass
+				# update the decorrelation matrices AFTER standard backprop, 
+				# else training breaks!
+				if isinstance(self.model, DecorrMamba) and train_decorr:
 					self.model.update_decorr_matrices()		
- 
+
 				if self.train_args.use_lr_sched:
 					# doesn't affect decorrelation lr
 					scheduler.step()
 
-			train_loss /= len(train_loader)
-			train_perplexity = math.exp(train_loss)
-			print(f"Train loss: {train_loss:.4f}, Train perplexity: {train_perplexity:.4f}")
+			epoch_train_ce_loss /= n_epoch_steps		
+			epoch_train_corr_loss /= n_epoch_steps
+			epoch_train_whit_loss /= n_epoch_steps
 
-			train_ce_losses.append(train_loss)
-			train_perplexities.append(train_perplexity)
-			wandb.log(
-				{"train_ce_loss": train_loss, 
-	 			 "train_perplex": train_perplexity,
-				 "epoch": epoch + 1})
-
-			if isinstance(self.model, DecorrMamba):
-				# epoch losses are summed automatically for each decorrelation layer within the model.
-				# this just sums all of these sums across every decorrelation layer and stores
-				# them within the parent model
-				self.model.sum_decorr_losses()			
-				total_correlation_loss = self.model.total_correlation_loss.item()
-				total_whitening_loss = self.model.total_whitening_loss.item()
-
-				correlation_loss = total_correlation_loss / len(train_loader)
-				whitening_loss = total_whitening_loss / len(train_loader)
-				print(
-					f"Train correlation loss: {correlation_loss:.4f}, Train whitening loss: {whitening_loss:.4f}")
-
-				train_corr_losses.append(correlation_loss)
-				train_whit_losses.append(whitening_loss)
-				wandb.log({"train_corr_loss": correlation_loss, 
-			   			   "train_whit_loss": whitening_loss,
-						   "epoch": epoch + 1})
-
+			print(f"Epoch train CE loss: {epoch_train_ce_loss:.4f}")
+			if isinstance(self.model, DecorrMamba):			
+				print(f"Epoch train correlation loss: {epoch_train_corr_loss:.4f}")
+				print(f"Epoch train whitening loss: {epoch_train_whit_loss:.4f}")					
 
 			# -------------------------------- validation -------------------------------------	
 
@@ -227,90 +226,187 @@ class MambaTrainer:
 
 			self.model.eval()
 
-			if isinstance(self.model, DecorrMamba):
-				# resets gradients and losses of decorrelation matrices
-				self.model.reset_decorr_layers()	
-
-			val_loss = 0.0
+			total_val_ce_loss = 0.0
+			total_val_corr_loss = 0.0
+			total_val_whit_loss = 0.0	
 
 			with torch.no_grad():
-				for in_seq, target_seq in val_loader:
-					out_seq = self.model(in_seq.to(self.device, non_blocking=True))
-
-					loss = criterion(
-						out_seq.view(-1, self.mamba_args.vocab_size), 
-						target_seq.to(self.device, non_blocking=True).view(-1))
+				with torch.amp.autocast(self.device.type, enabled=use_amp):	
 					
-					val_loss += loss.item()
+					for i, next_batch in enumerate(val_loader):
+						in_seq = next_batch[0].to(self.device, non_blocking=True)
 
+						assert torch.all(in_seq >= 0) and torch.all(in_seq < 16), "Data error!"
 
-			val_loss /= len(val_loader)
-			val_perplexity = math.exp(val_loss)
-			print(f"Val loss: {val_loss:.4f}, Val perplexity: {val_perplexity:.4f}")
+						out_seq = self.model(in_seq[:,:-1])
+						pred = out_seq[:,-1]
+						target = in_seq[:,-1]
+						loss = criterion(pred, target)
 
-			val_ce_losses.append(val_loss)
-			val_perplexities.append(val_perplexity)
+						if loss.isnan():
+							print(f"Loss in batch {i} returned nan!")
+							torch.save(out_seq, os.path.join(save_path, f"error_tensor_{i}.pt"))
+								
+						total_val_ce_loss += loss.item()
+
+						if isinstance(self.model, DecorrMamba):
+							self.model.mean_decorr_losses()
+							val_corr_loss = self.model.mean_corr_loss.item()
+							val_whit_loss = self.model.mean_whit_loss.item()
+							total_val_corr_loss += val_corr_loss
+							total_val_whit_loss += val_whit_loss				
+
+			total_val_ce_loss /= len(val_loader)
+			print(f"Epoch val CE loss: {total_val_ce_loss:.4f}")
 			wandb.log({
-				"val_ce_loss": val_loss, 
-				"val_perplex": val_perplexity,
-				"epoch": epoch + 1})
-
+				"val_ce_loss": total_val_ce_loss})
+			
 			if isinstance(self.model, DecorrMamba):
-				self.model.sum_decorr_losses()			
-				total_correlation_loss = self.model.total_correlation_loss.item()
-				total_whitening_loss = self.model.total_whitening_loss.item()
-
-				correlation_loss = total_correlation_loss / len(val_loader)
-				whitening_loss = total_whitening_loss / len(val_loader)
-				print(f"Val correlation loss: {correlation_loss:.4f}, Val whitening loss: {whitening_loss:.4f}")	
-
-				val_corr_losses.append(correlation_loss)
-				val_whit_losses.append(whitening_loss)	
+				total_val_corr_loss /= len(val_loader)
+				total_val_whit_loss /= len(val_loader)
+				print(f"Epoch val correlation loss: {total_val_corr_loss:.4f}")	
+				print(f"Epoch val whitening loss: {total_val_whit_loss:.4f}")				
 				wandb.log({
-					"val_corr_loss": correlation_loss, 
-					"val_whit_loss": whitening_loss,
-					"epoch": epoch + 1})
-
-			# saving model checkpoints and performance info
+					"val_corr_loss": total_val_corr_loss, 
+					"val_whit_loss": total_val_whit_loss})
 
 			if save_checkpoints and save_all_checkpoints:
 				torch.save(
 					self.model.state_dict(), os.path.join(save_path, f"epoch_{epoch}.pt"))
 
-			if val_loss < min_loss:
-				min_loss = val_loss
+			if total_val_ce_loss < min_loss:
+				min_loss = total_val_ce_loss
 				if save_checkpoints and not save_all_checkpoints:
 						torch.save(
 							self.model.state_dict(), os.path.join(save_path, f"epoch_{epoch}.pt"))
-						
-			if isinstance(self.model, DecorrMamba):
-				metrics = {
-				
-					"train_perplex": train_perplexities,
-					"val_perplex": val_perplexities,
-					"train_ce_loss": train_ce_losses,
-					"val_ce_loss": val_ce_losses,
 
-					"train_corr_loss": train_corr_losses,
-					"val_corr_loss": val_corr_losses,
-					"train_whit_loss": train_whit_losses,
-					"val_whit_loss": val_whit_losses
-				}
-			else:
-				metrics = {
-				
-					"train_perplex": train_perplexities,
-					"val_perplex": val_perplexities,
-					"train_ce_loss": train_ce_losses,
-					"val_ce_loss": val_ce_losses,
-				}				
+		return self.model	
 
-			with open(
-				os.path.join(save_path, "metrics.json"), "w") as json_file:
-				json.dump(metrics, json_file)
+	def overfit_induction(self, train_data: InductionData, n_epoch_steps: int, 
+		use_amp: bool, train_backprop: bool=True, train_decorr: bool=True):
 
+		''' 
+			Overfits to a single batch of training data from the induction
+			dataset, to check for implementational errors
 
-		return self.model
+		'''
+
+		criterion = nn.CrossEntropyLoss()
+
+		if not train_backprop:
+			print("Warning: not training backpropagation parameters!")
+		if not train_decorr:
+			print("Warning: not training decorrelation parameters!")
+		if not isinstance(self.model, DecorrMamba) and train_decorr:
+			print("Warning: train_decorr set to True but model does not use decorrelation!")
+
+		if self.train_args.weight_decay is not None:
+			optimizer = torch.optim.AdamW(
+				[{'params': self._param_groups['decay'],
+				  'weight_decay': self.train_args.weight_decay}, 
+
+				 {'params': self._param_groups['no_decay'], 
+				  'weight_decay': 0.0}], 
+
+				  lr=self.train_args.lr,
+				  betas=self.train_args.adam_beta,
+				  eps=self.train_args.adam_epsilon)
+			
+		else:
+			optimizer = torch.optim.Adam(self.model.parameters(), 
+										lr=self.train_args.lr, 
+										betas=self.train_args.adam_beta,
+										eps=self.train_args.adam_epsilon)    
+
+		if self.train_args.use_lr_sched:
+			scheduler = torch.optim.lr_scheduler.LambdaLR(
+				optimizer, lr_lambda=self.train_args.schedule_fn)
+
+		
+		save_path = os.path.join(".", "checkpoints")
+		os.makedirs(save_path, exist_ok=True)
+
+		scaler = torch.amp.GradScaler(self.device.type, enabled=use_amp)
+
+		train_batch = next(train_data).to(self.device, non_blocking=True)
+
+		for epoch in range(self.train_args.n_epochs):
+			print(f"Epoch: {epoch + 1}/{self.train_args.n_epochs}")
+
+			self.model.train()
+
+			assert n_epoch_steps is not None, "Specify number of steps per epoch"
+
+			epoch_train_ce_loss = 0.0
+			epoch_train_corr_loss = 0.0
+			epoch_train_whit_loss = 0.0
+
+			for i in tqdm(range(n_epoch_steps)):
+
+				optimizer.zero_grad()
+				if isinstance(self.model, DecorrMamba):
+					self.model.reset_decorr()
+
+				with torch.amp.autocast(self.device.type, enabled=use_amp):
+					# only care about how well the model predicts the last token
+					# when seeing the cue
+					out_seq = self.model(train_batch[:,:-1])
+					pred = out_seq[:,-1]
+					target = train_batch[:,-1]
+					loss = criterion(pred, target)		
+
+				epoch_train_ce_loss += loss.item()
+
+				# log every 10 steps
+				if i%10 == 0:
+					wandb.log({"train_ce_loss": loss.item()})							
+											
+				if isinstance(self.model, DecorrMamba):
+					# calculating mean losses across all decorrelation layers
+					self.model.mean_decorr_losses()			
+					train_corr_loss = self.model.mean_corr_loss.item()
+					train_whit_loss = self.model.mean_whit_loss.item()
+					epoch_train_corr_loss += train_corr_loss
+					epoch_train_whit_loss += train_whit_loss
+
+					if i%10 == 0:
+						wandb.log({"train_corr_loss": train_corr_loss, 
+								"train_whit_loss": train_whit_loss})	
+
+				if train_backprop:
+					scaler.scale(loss).backward()
+
+				# gradient clipping
+				if self.train_args.gradient_clip is not None:
+					scaler.unscale_(optimizer)
+					torch.nn.utils.clip_grad_norm_(self.model.parameters(), 
+												self.train_args.gradient_clip)
+
+				if train_backprop:
+					scaler.step(optimizer)
+					scaler.update()
+
+				# update the decorrelation matrices AFTER standard backprop, 
+				# else training breaks!
+				if isinstance(self.model, DecorrMamba) and train_decorr:
+					self.model.update_decorr_matrices()		
+
+				if self.train_args.use_lr_sched:
+					# doesn't affect decorrelation lr
+					scheduler.step()
+
+			epoch_train_ce_loss /= n_epoch_steps		
+			epoch_train_corr_loss /= n_epoch_steps
+			epoch_train_whit_loss /= n_epoch_steps
+
+			print(f"Epoch train CE loss: {epoch_train_ce_loss:.4f}")
+			if isinstance(self.model, DecorrMamba):			
+				print(f"Epoch train correlation loss: {epoch_train_corr_loss:.4f}")
+				print(f"Epoch train whitening loss: {epoch_train_whit_loss:.4f}")					
+
+			torch.save(
+				self.model.state_dict(), os.path.join(save_path, f"epoch_{epoch}.pt"))
+
 
 
 

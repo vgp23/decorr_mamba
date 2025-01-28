@@ -1,15 +1,18 @@
-# credit to https://github.com/hrbigelow/mamba-recall.git 
 import torch
+import numpy as np
+import pickle as pkl
+import os
 
+# credit to https://github.com/hrbigelow/mamba-recall.git 
 class InductionData:
-    def __init__(self, B, vocab_size, L, prefix_len):
+    def __init__(self, B: int, vocab_size: int, L: int, prefix_len:int):
         """
         Generates synthetic data of the form:
         ... S M .... S M
         where S is an 'induction token' and M is the token to memorize / recall
 
-        n_vocab: token alphabet size
-        seq_len: total sequence length to generate
+        vocab_size: token alphabet size
+        L: total sequence length to generate
         prefix_len: region where first S should occur
         """
         assert prefix_len < L - 4
@@ -18,19 +21,68 @@ class InductionData:
         self.L = L # total sequence length
         self.prefix_len = prefix_len # region where first induction token occurs
         self.vocab = list(range(self.vocab_size))
-        self.ind_tok = self.vocab_size
+        # this token is uniquely presented as the memorization and retrieval
+        # cue, appearning nowhere else
+        self.ind_tok = self.vocab_size-1
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        mem = torch.randint(0, self.vocab_size, (self.B,1))
-        batch = torch.randint(0, self.vocab_size, (self.B, self.L))
-        # inds = t.randint(0, self.P, (self.B,1))
-        inds = torch.full((self.B,1), 5)
+        # vocab_size-1 is specified because we only want the last token to
+        # come up as the memorization and retrieval cue
+
+        # the token to memorize, for each sequence
+        mem = torch.randint(0, self.vocab_size-1, (self.B,1))
+        batch = torch.randint(0, self.vocab_size-1, (self.B, self.L))
+        # indices where the first "S" token will be placed
+        inds = torch.randint(0, self.prefix_len, (self.B,1))
+        # indices where the second "S" token will be placed
         inds2 = torch.full((self.B,1), self.L-2)
+
+        # modify the randomly generated batch to include the S and M tokens in the 
+        # correct places
         batch.scatter_(1, inds, self.ind_tok)
         batch.scatter_(1, inds+1, mem)
         batch.scatter_(1, inds2, self.ind_tok)
         batch.scatter_(1, inds2+1, mem)
-        return dict(starts=inds, tokens=batch)
+
+        return batch
+    
+def create_validation_set(vocab_size, L, prefix_len, n_seq, path):
+    ''' Creates a fixed validation dataset on which the model will be tested'''
+
+    # return the entire dataset as one batch
+    dataset = InductionData(n_seq, vocab_size, L, prefix_len)
+    all_data = next(iter(dataset))
+
+    with open(path, 'wb') as file:
+        # Serialize the array and save it to the file
+        pkl.dump(all_data.numpy(), file)
+
+if __name__ == "__main__":
+
+    dataset_name = "val"
+    vocab_size = 16
+    n_seq = int(2048*8/10) # 10 percent of size of training "dataset"
+    prefix_len = 64
+    L = 256
+
+    # construct the full path for the pickle file
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    dataset_dir = os.path.join(current_dir, "..", "..", "..", "datasets", "induction_heads")
+    os.makedirs(dataset_dir, exist_ok=True)
+    
+    dataset_name = f"{dataset_name}_vocabsize_{vocab_size}_nseq_{n_seq}_L_{L}_prefixlen_{prefix_len}"
+    file_path = os.path.join(dataset_dir, f'{dataset_name}.pkl')
+
+    # create dataset
+    create_validation_set(vocab_size, L, prefix_len, n_seq, file_path)
+
+    # with open(file_path, 'rb') as file:
+    #     # Deserialize the array
+    #     loaded_arr = pkl.load(file)
+
+    # print(np.sum(loaded_arr[0] == 15))
+
+
