@@ -35,8 +35,9 @@ class InductionData:
         # the token to memorize, for each sequence
         mem = torch.randint(0, self.vocab_size-1, (self.B,1))
         batch = torch.randint(0, self.vocab_size-1, (self.B, self.L))
-        # indices where the first "S" token will be placed
-        inds = torch.randint(0, self.prefix_len, (self.B,1))
+        # index where the first "S" token will be placed. This position is the
+        # same across an entire batch, but varies across batches. 
+        inds = torch.randint(0, self.prefix_len, (1,))*torch.ones((self.B, 1)).to(torch.int64)
         # indices where the second "S" token will be placed
         inds2 = torch.full((self.B,1), self.L-2)
 
@@ -53,12 +54,15 @@ def create_validation_set(vocab_size, L, prefix_len, n_seq, path):
     ''' Creates a fixed validation dataset on which the model will be tested'''
 
     # return the entire dataset as one batch
-    dataset = InductionData(n_seq, vocab_size, L, prefix_len)
-    all_data = next(iter(dataset))
+    dataset = InductionData(1, vocab_size, L, prefix_len)
+    dataset_iter = iter(dataset)
+    dataset_storage = torch.zeros(n_seq, L)
+    for i in range(n_seq):
+        dataset_storage[i, :] = next(dataset_iter)
 
     with open(path, 'wb') as file:
         # Serialize the array and save it to the file
-        pkl.dump(all_data.numpy(), file)
+        pkl.dump(dataset_storage.numpy(), file)
 
 if __name__ == "__main__":
 
@@ -82,6 +86,12 @@ if __name__ == "__main__":
     # with open(file_path, 'rb') as file:
     #     # Deserialize the array
     #     loaded_arr = pkl.load(file)
+
+    # print(loaded_arr.shape)
+    
+
+
+
 
     # print(np.sum(loaded_arr[0] == 15))
 

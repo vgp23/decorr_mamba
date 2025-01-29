@@ -12,6 +12,8 @@ from ..model.mamba import Mamba
 from ..model.decorrelation import DecorrMamba, apply_to_decorr
 from ..data.synthetics import InductionData
 
+# os.environ["WANDB_SILENT"] = "true"
+
 class MambaTrainer:
 	''' Trains a Mamba architecture according to a pre-specified configuration
 
@@ -186,18 +188,70 @@ class MambaTrainer:
 
 				if train_backprop:
 					scaler.scale(loss).backward()
-				
-				for name, param in self.model.named_parameters():
-					if param.grad is not None:
-						update_ratio = torch.norm(param.grad) / torch.norm(param)
-						print(f"Layer: {name}, Update Ratio: {update_ratio.item()}")
 
 				# gradient clipping
 				if self.train_args.gradient_clip is not None:
 					scaler.unscale_(optimizer)
 					torch.nn.utils.clip_grad_norm_(self.model.parameters(), 
 												self.train_args.gradient_clip)
+				
+				# calculating weight and gradient update information
+				if i%10 == 0:
+					n_pars = 0
+					
+					mean_update_ratio = 0.0
+					min_update_ratio = float("inf")
+					max_update_ratio = -float("inf")
 
+					mean_grad_norm = 0.0
+					min_grad_norm = float("inf")
+					max_grad_norm = -float("inf")
+
+					mean_weight_norm = 0.0
+					min_weight_norm = float("inf")
+					max_weight_norm = -float("inf")
+
+					for _, param in self.model.named_parameters():
+						if param.grad is not None:
+							n_pars += 1
+							# weight norm stats
+							weight_norm = torch.norm(param).item()
+							mean_weight_norm += weight_norm
+							if weight_norm < min_weight_norm:
+								min_weight_norm = weight_norm
+							if weight_norm > max_weight_norm:
+								max_weight_norm = weight_norm			
+
+							# raw gradient norm stats
+							grad_norm = torch.norm(param.grad).item()
+							mean_grad_norm += grad_norm
+							if grad_norm < min_grad_norm:
+								min_grad_norm = grad_norm
+							if grad_norm > max_grad_norm:
+								max_grad_norm = grad_norm
+
+							# update ratio stats
+							update_ratio = grad_norm / weight_norm
+							mean_update_ratio += update_ratio
+							if update_ratio < min_update_ratio:
+								min_update_ratio = update_ratio
+							if update_ratio > max_update_ratio:
+								max_update_ratio = update_ratio
+
+					mean_weight_norm /= n_pars
+					mean_grad_norm /= n_pars
+					mean_update_ratio /= n_pars
+
+					wandb.log({"mean_weight_norm": mean_weight_norm, 
+							   "mean_grad_norm": mean_grad_norm,
+							   "mean_update_ratio": mean_update_ratio,
+							   "min_weight_norm": min_weight_norm,
+							   "max_weight_norm": max_weight_norm,
+							   "min_grad_norm": min_grad_norm,
+							   "max_grad_norm": max_grad_norm,
+							   "min_update_ratio": min_update_ratio,
+							   "max_update_ratio": max_update_ratio})
+				
 				if train_backprop:
 					scaler.step(optimizer)
 					scaler.update()

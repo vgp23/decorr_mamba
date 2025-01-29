@@ -259,7 +259,6 @@ class DecorrLinear(nn.Module):
 
 		self.corr_loss = 0
 		self.whit_loss = 0
-		self.grad = None
 		self.gain_factor = None
 
 		self.loss = DecorrLoss()
@@ -326,7 +325,7 @@ class DecorrLinear(nn.Module):
 
 				self.corr_loss = corr_loss
 				self.whit_loss = whit_loss
-				self.grad = grad 
+				self.decorr_layer.grad = grad 
 
 				if self.use_gain_scaling:
 					# take expectations across all samples. Compute the gain vector according 
@@ -340,7 +339,7 @@ class DecorrLinear(nn.Module):
 	def reset(self):
 		self.corr_loss = 0
 		self.whit_loss = 0
-		self.grad = None
+		self.decorr_layer.grad = None
 		self.gain_factor = None
 
 	def train(self, mode: bool = True):
@@ -560,7 +559,7 @@ class DecorrConv1d(DecorrLinear):
 					self.corr_loss = corr_loss
 					self.whit_loss = whit_loss
 					# updates happen on entire network at once in training loop
-					self.grad = grad   				
+					self.decorr_layer.grad = grad   				
 
 					if self.use_gain_scaling:
 						# collapse across batch and length dimensions, then
@@ -623,7 +622,7 @@ class DecorrConv1d(DecorrLinear):
 					self.corr_loss = corr_loss
 					self.whit_loss = whit_loss
 					# updates happen on entire network at once in training loop
-					self.grad = grad  
+					self.decorr_layer.grad = grad  
 
 					if self.use_gain_scaling:
 						# collapse across batch and patch dimensions, then
@@ -700,7 +699,7 @@ class DecorrConv1d(DecorrLinear):
 					self.corr_loss = corr_loss
 					self.whit_loss = whit_loss
 					# updates happen on entire network at once in training loop
-					self.grad = grad
+					self.decorr_layer.grad = grad
 
 					if self.use_gain_scaling:
 						# collapse across batch and embedding*n_patches dimensions, then
@@ -714,7 +713,7 @@ class DecorrConv1d(DecorrLinear):
 
 		# decorrelates each patch channel's input features independently,
 		# using a separate decorrelation matrix for all channels	
-		else:
+		elif self.mode == "channel_independent":
 			# represent each patch as a matrix
 
 			#(B, n_patches, D, conv_1d_size)
@@ -795,7 +794,7 @@ class DecorrConv1d(DecorrLinear):
 					self.corr_loss = corr_loss
 					self.whit_loss = whit_loss
 					# updates happen on entire network at once in training loop
-					self.grad = grad 
+					self.decorr_layer.grad = grad 
 
 					if self.use_gain_scaling:
 						# take expectations across the sample dimension. Compute
@@ -809,7 +808,9 @@ class DecorrConv1d(DecorrLinear):
 
 						self.gain_vector = torch.sqrt(
 							torch.mean(selected**2, axis=1) / (torch.mean(selected_decorr**2, axis=1)) + 1e-08)
-
+		else:
+			raise NotImplementedError
+		
 		if self.original_layer.bias is not None:
 			y += self.original_layer.bias
 
@@ -989,11 +990,11 @@ class DecorrMamba(Mamba):
 			for child in module.children():
 				if isinstance(child, DecorrLinear):
 
-					assert child.grad is not None, "Gradient not computed"
+					assert child.decorr_layer.grad is not None, "Gradient not computed"
 
 					unscaled_update = \
 						child.decorr_layer.data - \
-						self.decorr_lr * child.grad @ child.decorr_layer.data
+						self.decorr_lr * child.decorr_layer.grad @ child.decorr_layer.data
 
 					# gain scaling as per Ahmad (2024)
 					if child.use_gain_scaling:
