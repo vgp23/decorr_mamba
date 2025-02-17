@@ -18,7 +18,7 @@ class TrainingArgs():
 		Default values for these parameters (where applicable) can be found in the .json
 		files in the template_experiment folder.'''
 
-	n_epochs: int
+	n_steps: int
 	L: int  
 	B: int 
 	lr: float
@@ -31,29 +31,34 @@ class TrainingArgs():
 	# parameters of the learning rate schedule
 	use_lr_sched: bool
 	min_lr: float
-	warmup_epochs: int
+
+	# n_steps and warmup_steps can refer to both epochs and gradient descent
+	# steps
+	warmup_steps: int
 	
 	def __post_init__(self):
 		# NB specification in the paper uses 5x the learning rate of a comparable 
 		# GPT3 architecture as the peak schedule LR, for language modelling. The learning rate 
 		# should be selected using this method, in language modelling cases!
 
+		assert self.n_steps is not None, "Must specify n_steps"
 		if self.use_lr_sched:
-			assert self.warmup_epochs is not None, "Warmup epochs specification missing"
-			assert self.warmup_epochs < self.n_epochs, "Warmup epochs > total epochs"
+			assert self.warmup_steps is not None, "Warmup epochs/steps specification missing"
+			assert self.warmup_steps < self.n_steps, "Warmup epochs/steps > total epochs/steps"
+
 			self.schedule_fn: Callable[[int], float] = self._lm_learning_schedule
+
 			assert self.lr > self.min_lr, \
 				"Minimum learning rate greater than the peak learning rate"
 
-
-	def _lm_learning_schedule(self, epoch):
+	def _lm_learning_schedule(self, step):
 		# a cosine decay with a minimum value, with a linear warm-up
-		if epoch < self.warmup_epochs:
-			return float(epoch+1) / float(max(1, self.warmup_epochs))
+		if step < self.warmup_steps:
+			return float(step+1) / float(max(1, self.warmup_steps))
 		else:
 			# calculate amount of decay progress
-			progress = float(epoch - self.warmup_epochs + 1) / \
-							float(max(1, self.n_epochs - self.warmup_epochs))
+			progress = float(step - self.warmup_steps + 1) / \
+							float(max(1, self.n_steps - self.warmup_steps))
 			# shift cosine function up, rescale, and compute the appropriate amount
 			# of decay
 			cosine_decay = 0.5 * (1+ math.cos(math.pi * progress))
@@ -61,21 +66,22 @@ class TrainingArgs():
 			# value
 			return cosine_decay * (1 - self.min_lr / self.lr) + self.min_lr / self.lr
 	
+	
 	def show_lr_schedule(self):
 		# visualization of the learning rate schedule given the specified
 		# training protocol
-		epochs = np.arange(0, self.n_epochs)
-		lrs = np.zeros(len(epochs))
-		for e in epochs:
-			lrs[e] = self.lr*self._lm_learning_schedule(e)
+		steps = np.arange(0, self.n_steps)
+		lrs = np.zeros(len(steps))
+		for step in steps:
+			lrs[step] = self.lr*self._lm_learning_schedule(step)
 
-		min_lr = np.min(lrs[self.warmup_epochs+1:])
+		min_lr = np.min(lrs[self.warmup_steps+1:])
 		max_lr = np.max(lrs)
 
 		plt.figure()
-		plt.plot(epochs, lrs)
-		plt.xlim([0,self.n_epochs-1])
-		plt.xlabel("Epoch")
+		plt.plot(steps, lrs)
+		plt.xlim([0,self.n_steps-1])
+		plt.xlabel("Step")
 		plt.ylabel("Learning rate")
 		plt.title(f"Max = {max_lr}, \nMin = {min_lr:.2e}")
 		plt.show()
@@ -294,6 +300,14 @@ class LanguageDatasetMaker:
 			token_ids[int((self.train_split+self.val_split) * len(token_ids)) + 1:])
 
 		return train_set, val_set, test_set
+	
+
+if __name__ == "__main__":
+	test = TrainingArgs(n_steps=10000, lr=8e-3, use_lr_sched=True, 
+					 min_lr = 1e-5, warmup_steps=1000, 
+					 L=None, B=None, adam_beta=None, adam_epsilon=None, gradient_clip=None, weight_decay=None)
+
+	test.show_lr_schedule()
 
 
 
