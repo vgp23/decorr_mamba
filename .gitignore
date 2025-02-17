@@ -159,7 +159,7 @@ decorr_mamba/decorr_mamba.egg-info/
 /experiments/
 main.py
 /datasets/
-
+/OLD/
 # Cython debug symbols
 cython_debug/
 
