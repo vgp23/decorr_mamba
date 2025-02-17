@@ -13,6 +13,8 @@ class Mamba(nn.Module):
 	def __init__(self, model_args: MambaArgs):
 		super(Mamba, self).__init__()
 
+		print("USING NEW IMPLEMENTATION")
+
 		self.model_args = model_args
 
 		# TODO: implement decorrelation here as well?
@@ -33,10 +35,14 @@ class Mamba(nn.Module):
 			initializer_range: float = 0.02,  # only used for embedding layer 
 			rescale_prenorm_residual=True):
 
-			# slightly modified from original code. Use of biases in the projection layers
-			# is controlled by the MambaArgs class, no need to enforce that here. 
+			# All biases for linear layers are initialized at 0,
+			# except for the upscale projections for delta
+			if isinstance(module, nn.Linear):
+				if module.bias is not None:
+					if not getattr(module.bias, "_no_reinit", False):
+						nn.init.zeros_(module.bias)
 
-			if isinstance(module, nn.Embedding):
+			elif isinstance(module, nn.Embedding):
 				nn.init.normal_(module.weight, std=initializer_range)
 
 			if rescale_prenorm_residual:
@@ -251,6 +257,8 @@ class S6Block(nn.Module):
 		# bias based on empirical work
 		with torch.no_grad():
 			self.delta_upscale.bias.copy_(get_delta_bias())
+		# Default initialization sets all linear bias terms to zero, avoid here
+		self.delta_upscale.bias._no_reinit = True
 
 		# papers imply this is taken care of by residual connections
 		# around the block, but it seems they also implement it here
@@ -301,16 +309,22 @@ class S6Block(nn.Module):
 		A_bar, B_bar_x = self.discretize(delta, B, x) # (B, L, D, N)
 		
 		# scan through each individual token to compute hidden states
-		hidden_states = torch.zeros(
-			b, l+1, self.model_args.D_inner, self.model_args.N).to(self.model_args.device)
+		# hidden_states = torch.zeros(
+		# 	b, l+1, self.model_args.D_inner, self.model_args.N).to(self.model_args.device)
+
+		hidden_states = []
+		h = torch.zeros(b, self.model_args.D_inner, self.model_args.N, requires_grad=True).to(
+			self.model_args.device)
+		hidden_states.append(h)
 		
 		for i in range(0,l):
 			# because A is represented only through diagonal, Ah_t-1 is 
 			# equivalent to taking the elementwise product of the diagonal
 			# and the hidden state
-			hidden_states[:,i+1,:,:] = A_bar[:,i,:,:]*hidden_states[:,i,:,:].clone() + \
-				B_bar_x[:,i,:,:] # (B,D,N)
-		
+			h = A_bar[:,i,:,:]*h + B_bar_x[:,i,:,:] # (B,D,N)
+			hidden_states.append(h)
+
+		hidden_states = torch.stack(hidden_states, dim=1)
 		# compute outputs in parallel
 		outputs = torch.einsum('bln, bldn -> bld', C, hidden_states[:,1:,:,:])
 
