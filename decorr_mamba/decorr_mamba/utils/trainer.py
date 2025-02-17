@@ -66,10 +66,247 @@ class MambaTrainer:
 			# weight tying causes the embedding and output weights to be the same,
 			# but the logic above counts this parameter twice. Remove to fix.
 			del self._param_groups["decay"][-1]
-	
+
+	def train_sequence(self, train_loader: DataLoader, val_loader: DataLoader, 
+		use_amp: bool,log_freq: int, train_backprop: bool=True, 
+		train_decorr: bool=True, save_checkpoints: bool=True, save_all_checkpoints: bool=False):
+
+		''' 
+		Trains the model with the protocol specified in train_args.
+
+		Args:
+			train_loader (DataLoader): PyTorch-compatible training dataloader
+			val_loader (DataLoader): PyTorch-compatible validation dataloader
+			train_backprop (bool, optional): turns on parameter updating for everything
+				other than decorrelation matrices, allows for sanity check
+				of decorrelation learning rule. Defaults to 'True'
+			train_decorr(bool, optional): turns on training for decorrelation matrices.
+				Defaults to 'True'
+			save_checkpoints (bool, optional): controls whether checkpoints are saved
+				during epochs. Defaults to 'True'
+			save_all_checkpoints (bool, optional): if saving checkpoints, controls
+				whether all epoch checkpoints are saved or just those where the loss
+				is better than the previous minimum. Defaults to 'False.	
+			use_amp (bool): determines if training with automatic mixed precision 
+				or not. 
+			log_freq (int): the number of steps between every log to wandb
+
+		'''
+
+		criterion = nn.CrossEntropyLoss()
+		if not train_backprop:
+			print("Warning: not training backpropagation parameters!")
+		if not train_decorr:
+			print("Warning: not training decorrelation parameters!")
+		if not isinstance(self.model, DecorrMamba) and train_decorr:
+			print("Warning: train_decorr set to True but model does not use decorrelation!")
+
+		if not save_checkpoints:
+			assert not save_all_checkpoints, \
+			"Cannot save all checkpoints, as save_checkpoints is set to False." 
+
+		if self.train_args.weight_decay is not None:
+			optimizer = torch.optim.AdamW(
+				[{'params': self._param_groups['decay'],
+				  'weight_decay': self.train_args.weight_decay}, 
+
+				 {'params': self._param_groups['no_decay'], 
+				  'weight_decay': 0.0}], 
+
+				  lr=self.train_args.lr,
+				  betas=self.train_args.adam_beta,
+				  eps=self.train_args.adam_epsilon)
+			
+		else:
+			optimizer = torch.optim.Adam(self.model.parameters(), 
+										lr=self.train_args.lr, 
+										betas=self.train_args.adam_beta,
+										eps=self.train_args.adam_epsilon)    
+
+		if self.train_args.use_lr_sched:
+			scheduler = torch.optim.lr_scheduler.LambdaLR(
+				optimizer, lr_lambda=self.train_args.schedule_fn)
+
+		min_loss = float("inf")
+		
+		save_path = os.path.join(".", "checkpoints")
+		os.makedirs(save_path, exist_ok=True)
+
+		scaler = torch.amp.GradScaler(self.device.type, enabled=use_amp)
+
+		for epoch in range(self.train_args.n_epochs):
+			print(f"Epoch: {epoch + 1}/{self.train_args.n_epochs}")
+
+			self.model.train()
+
+			epoch_train_ce_loss = 0.0
+			epoch_train_corr_loss = 0.0
+			epoch_train_whit_loss = 0.0
+
+			for next_batch in tqdm(train_loader):
+
+				optimizer.zero_grad()
+				if isinstance(self.model, DecorrMamba):
+					self.model.reset_decorr()
+				
+				in_seq = next_batch.to(self.device, non_blocking=True)
+
+				with torch.amp.autocast(self.device.type, enabled=use_amp):
+					# shift input sequence by one token and compare
+					pred = self.model(in_seq[:,:-1]).logits
+					target = in_seq[:,1:]
+					loss = criterion(pred, target)		
+
+				# del in_seq
+				# torch.cuda.empty_cache()
+
+				epoch_train_ce_loss += loss.item()
+
+				if i%log_freq == 0:
+					wandb.log({"train_ce_loss": loss.item()})							
+											
+				if isinstance(self.model, DecorrMamba):
+					# calculating mean losses across all decorrelation layers
+					self.model.mean_decorr_losses()			
+					train_corr_loss = self.model.mean_corr_loss.item()
+					train_whit_loss = self.model.mean_whit_loss.item()
+					epoch_train_corr_loss += train_corr_loss
+					epoch_train_whit_loss += train_whit_loss
+
+					if i%log_freq == 0:
+						wandb.log({"train_corr_loss": train_corr_loss, 
+								"train_whit_loss": train_whit_loss})	
+
+				if train_backprop:
+					scaler.scale(loss).backward()
+
+				# gradient clipping
+				if self.train_args.gradient_clip is not None:
+					scaler.unscale_(optimizer)
+					torch.nn.utils.clip_grad_norm_(self.model.parameters(), 
+												self.train_args.gradient_clip)
+				
+				# calculating update ratio information
+				if i%log_freq == 0:
+					n_pars = 0
+					
+					mean_update_ratio = 0.0
+					min_update_ratio = float("inf")
+					max_update_ratio = -float("inf")
+
+					for _, param in self.model.named_parameters():
+						if param.grad is not None:
+
+							n_pars += 1
+							weight_norm = torch.norm(param).item()		
+							grad_norm = torch.norm(param.grad).item()
+							update_ratio = grad_norm / weight_norm
+							mean_update_ratio += update_ratio
+							if update_ratio < min_update_ratio:
+								min_update_ratio = update_ratio
+							if update_ratio > max_update_ratio:
+								max_update_ratio = update_ratio
+
+					mean_update_ratio /= n_pars
+
+					wandb.log({"update_ratio/mean": mean_update_ratio,
+							   "update_ratio/min": min_update_ratio,
+							   "update_ratio/max": max_update_ratio})									
+
+			
+				if train_backprop:
+					scaler.step(optimizer)
+					scaler.update()
+
+				# update the decorrelation matrices AFTER standard backprop, 
+				# else training breaks!
+				if isinstance(self.model, DecorrMamba) and train_decorr:
+					self.model.update_decorr_matrices()		
+
+				if self.train_args.use_lr_sched:
+					# doesn't affect decorrelation lr
+					scheduler.step()
+
+			epoch_train_ce_loss /= len(train_loader)		
+			epoch_train_corr_loss /= len(train_loader)
+			epoch_train_whit_loss /= len(train_loader)
+
+			print(f"Epoch train CE loss: {epoch_train_ce_loss:.4f}")
+			if isinstance(self.model, DecorrMamba):			
+				print(f"Epoch train correlation loss: {epoch_train_corr_loss:.4f}")
+				print(f"Epoch train whitening loss: {epoch_train_whit_loss:.4f}")					
+
+			# -------------------------------- validation -------------------------------------	
+
+			# apply_to_decorr(self.model, lambda module: print(getattr(module, "decorr_layer")))
+
+			self.model.eval()
+
+			total_val_ce_loss = 0.0
+			total_val_corr_loss = 0.0
+			total_val_whit_loss = 0.0	
+
+			with torch.no_grad():
+				with torch.amp.autocast(self.device.type, enabled=use_amp):	
+					
+					for next_batch in val_loader:
+						in_seq = next_batch.to(self.device, non_blocking=True)
+						pred = self.model(in_seq[:,:-1])
+						target = in_seq[:,1:]
+						loss = criterion(pred, target)
+
+						# if loss.isnan():
+						# 	print(f"Loss in batch {i} returned nan!")
+						# 	torch.save(out_seq, os.path.join(save_path, f"error_tensor_{i}.pt"))
+								
+						total_val_ce_loss += loss.item()
+
+						if isinstance(self.model, DecorrMamba):
+							self.model.mean_decorr_losses()
+							val_corr_loss = self.model.mean_corr_loss.item()
+							val_whit_loss = self.model.mean_whit_loss.item()
+							total_val_corr_loss += val_corr_loss
+							total_val_whit_loss += val_whit_loss				
+
+			total_val_ce_loss /= len(val_loader)
+			print(f"Epoch val CE loss: {total_val_ce_loss:.4f}")
+			wandb.log({
+				"val_ce_loss": total_val_ce_loss})
+			
+			if isinstance(self.model, DecorrMamba):
+				total_val_corr_loss /= len(val_loader)
+				total_val_whit_loss /= len(val_loader)
+				print(f"Epoch val correlation loss: {total_val_corr_loss:.4f}")	
+				print(f"Epoch val whitening loss: {total_val_whit_loss:.4f}")				
+				wandb.log({
+					"val_corr_loss": total_val_corr_loss, 
+					"val_whit_loss": total_val_whit_loss})
+
+			if save_checkpoints and save_all_checkpoints:
+				torch.save({
+					"model_state": self.model.state_dict(),
+					"optimizer_state": optimizer.state_dict(),}, 
+					os.path.join(save_path, f"epoch_{epoch}.pth")) 
+				
+				wandb.save(os.path.join(save_path, f"epoch_{epoch}.pth"))
+
+			# saves only if performance improves, if training was 
+			# configured this way
+			if total_val_ce_loss < min_loss:
+				min_loss = total_val_ce_loss
+				if save_checkpoints and not save_all_checkpoints:
+					torch.save({
+						"model_state": self.model.state_dict(),
+						"optimizer_state": optimizer.state_dict(),}, 
+						os.path.join(save_path, f"epoch_{epoch}.pth"))
+					
+					wandb.save(os.path.join(save_path, f"epoch_{epoch}.pth"))
+
+		return self.model	
+		
 	def train_induction(self, train_data: InductionData, val_loader: DataLoader, 
-		n_epoch_steps: int, use_amp: bool, train_backprop: bool=True, train_decorr: bool=True, 
-		save_checkpoints: bool=True, save_all_checkpoints: bool=False):
+		n_epoch_steps: int, use_amp: bool,log_freq: int, train_backprop: bool=True, 
+		train_decorr: bool=True, save_checkpoints: bool=True, save_all_checkpoints: bool=False):
 
 		''' 
 		Trains the model with the protocol specified in train_args.
@@ -92,6 +329,7 @@ class MambaTrainer:
 				is better than the previous minimum. Defaults to 'False.	
 			use_amp (bool): determines if training with automatic mixed precision 
 				or not. 
+			log_freq (int): the number of steps between every log to wandb
 
 		'''
 
@@ -170,8 +408,7 @@ class MambaTrainer:
 
 				epoch_train_ce_loss += loss.item()
 
-				# log every 10 steps
-				if i%10 == 0:
+				if i%log_freq == 0:
 					wandb.log({"train_ce_loss": loss.item()})							
 											
 				if isinstance(self.model, DecorrMamba):
@@ -182,7 +419,7 @@ class MambaTrainer:
 					epoch_train_corr_loss += train_corr_loss
 					epoch_train_whit_loss += train_whit_loss
 
-					if i%10 == 0:
+					if i%log_freq == 0:
 						wandb.log({"train_corr_loss": train_corr_loss, 
 								"train_whit_loss": train_whit_loss})	
 
@@ -195,42 +432,20 @@ class MambaTrainer:
 					torch.nn.utils.clip_grad_norm_(self.model.parameters(), 
 												self.train_args.gradient_clip)
 				
-				# calculating weight and gradient update information
-				if i%10 == 0:
+				# calculating update ratio information
+				if i%log_freq == 0:
 					n_pars = 0
 					
 					mean_update_ratio = 0.0
 					min_update_ratio = float("inf")
 					max_update_ratio = -float("inf")
 
-					mean_grad_norm = 0.0
-					min_grad_norm = float("inf")
-					max_grad_norm = -float("inf")
-
-					mean_weight_norm = 0.0
-					min_weight_norm = float("inf")
-					max_weight_norm = -float("inf")
-
 					for _, param in self.model.named_parameters():
 						if param.grad is not None:
+
 							n_pars += 1
-							# weight norm stats
-							weight_norm = torch.norm(param).item()
-							mean_weight_norm += weight_norm
-							if weight_norm < min_weight_norm:
-								min_weight_norm = weight_norm
-							if weight_norm > max_weight_norm:
-								max_weight_norm = weight_norm			
-
-							# raw gradient norm stats
+							weight_norm = torch.norm(param).item()		
 							grad_norm = torch.norm(param.grad).item()
-							mean_grad_norm += grad_norm
-							if grad_norm < min_grad_norm:
-								min_grad_norm = grad_norm
-							if grad_norm > max_grad_norm:
-								max_grad_norm = grad_norm
-
-							# update ratio stats
 							update_ratio = grad_norm / weight_norm
 							mean_update_ratio += update_ratio
 							if update_ratio < min_update_ratio:
@@ -238,20 +453,13 @@ class MambaTrainer:
 							if update_ratio > max_update_ratio:
 								max_update_ratio = update_ratio
 
-					mean_weight_norm /= n_pars
-					mean_grad_norm /= n_pars
 					mean_update_ratio /= n_pars
 
-					wandb.log({"mean_weight_norm": mean_weight_norm, 
-							   "mean_grad_norm": mean_grad_norm,
-							   "mean_update_ratio": mean_update_ratio,
-							   "min_weight_norm": min_weight_norm,
-							   "max_weight_norm": max_weight_norm,
-							   "min_grad_norm": min_grad_norm,
-							   "max_grad_norm": max_grad_norm,
-							   "min_update_ratio": min_update_ratio,
-							   "max_update_ratio": max_update_ratio})
-				
+					wandb.log({"update_ratio/mean": mean_update_ratio,
+							   "update_ratio/min": min_update_ratio,
+							   "update_ratio/max": max_update_ratio})									
+
+			
 				if train_backprop:
 					scaler.step(optimizer)
 					scaler.update()
@@ -325,14 +533,24 @@ class MambaTrainer:
 					"val_whit_loss": total_val_whit_loss})
 
 			if save_checkpoints and save_all_checkpoints:
-				torch.save(
-					self.model.state_dict(), os.path.join(save_path, f"epoch_{epoch}.pt"))
+				torch.save({
+					"model_state": self.model.state_dict(),
+					"optimizer_state": optimizer.state_dict(),}, 
+					os.path.join(save_path, f"epoch_{epoch}.pth")) 
+				
+				wandb.save(os.path.join(save_path, f"epoch_{epoch}.pth"))
 
+			# saves only if performance improves, if training was 
+			# configured this way
 			if total_val_ce_loss < min_loss:
 				min_loss = total_val_ce_loss
 				if save_checkpoints and not save_all_checkpoints:
-						torch.save(
-							self.model.state_dict(), os.path.join(save_path, f"epoch_{epoch}.pt"))
+					torch.save({
+						"model_state": self.model.state_dict(),
+						"optimizer_state": optimizer.state_dict(),}, 
+						os.path.join(save_path, f"epoch_{epoch}.pth"))
+					
+					wandb.save(os.path.join(save_path, f"epoch_{epoch}.pth"))
 
 		return self.model	
 
@@ -460,6 +678,7 @@ class MambaTrainer:
 
 			torch.save(
 				self.model.state_dict(), os.path.join(save_path, f"epoch_{epoch}.pt"))
+
 
 
 
