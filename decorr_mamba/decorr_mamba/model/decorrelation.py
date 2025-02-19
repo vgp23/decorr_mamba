@@ -840,6 +840,83 @@ def apply_to_decorr(model, f):
 	model.apply(_apply_to_decorr)
 
 
+class TrackedParameter(nn.Parameter):
+	"""A wrapper around nn.Parameter that logs inputs during matrix multiplication."""
+	
+	def __new__(cls, data, requires_grad=True):
+		instance = super(TrackedParameter, cls).__new__(cls, data)
+		instance.requires_grad = requires_grad
+		instance.inputs = []
+		return instance
+		
+
+	def __matmul__(self, other):
+		"""Intercepts matrix multiplication to log the input."""
+		self.inputs.append(other.clone().detach())
+		return super().__matmul__(self, other)
+
+	def __rmatmul__(self, other):
+		"""Tracks all tensors that multiplied self: x @ W"""
+		self.inputs.append(other.clone().detach()) 
+		return super().__rmatmul__(other)	
+
+	def transpose(self, dim0, dim1):
+		""" Ensures transposition is also tracked """
+		# Make a new parameter, morifying the same inputs list as the original
+		transposed_parameter = TrackedParameter(super().transpose(dim0, dim1))
+		transposed_parameter.inputs = self.inputs
+		return transposed_parameter
+
+	@property
+	def T(self):
+		""" Handles W.T so it retains tracking """
+		return self.transpose(0, 1)
+
+
+class DecorrLinearNew(nn.Linear):
+	def __init__(self, original_layer: nn.Linear = None, 
+			sample_frac: float = 0.1, kappa: float = 0.5, **factory_kwargs):
+
+		# allows layer to be created on top of existing one, or made from
+		# scratch
+		if original_layer is not None:
+			self.__dict__.update(original_layer.__dict__)
+		else:
+			super(DecorrLinearNew, self).__init__(**factory_kwargs)
+
+		self.decorr_layer = nn.Parameter(
+			torch.eye(self.weight.shape[1]), requires_grad=False)
+
+		self.register_parameter("original_weight", nn.Parameter(self.weight))
+		# delete self.weight, because we'll be overwriting it later
+		del self._parameters["weight"]
+
+		# fuse decorrelation and original weights into a single
+		# weight matrix, then track its input to allow decorrelation
+		# loss to be computed later. requires_grad is false, because we only want
+		# to update original_weight with regular backprop. 
+
+		# this tracks multiplications of form W @ X, W.T @ X, X @ W and X @ W.T
+		fused_weight = TrackedParameter(
+			self.original_weight @ self.decorr_layer, requires_grad=False)
+		self.register_parameter("weight", fused_weight)
+
+		# this tracks inputs during the standard forward pass
+		self.register_forward_hook(self.track_weight_input)
+
+
+		# decorrelation training parameters
+		self.sample_frac = sample_frac
+		self.kappa = kappa
+		self.corr_loss = 0
+		self.whit_loss = 0
+
+	def track_weight_input(self, module, input, output):
+		self.weight.inputs = input[0].clone().detach()
+
+	def reset(self):
+		pass
+
 class DecorrMamba(MambaLMHeadModel):
 	"""
 	Mamba architecture with built-in decorrelation layers and additional functionality
@@ -933,16 +1010,15 @@ class DecorrMamba(MambaLMHeadModel):
 			for name, child in module.named_children():
 				if name == "in_proj" or name == "out_proj" or name == "x_proj":
 					self.n_decorr_layers += 1
-					setattr(module, name, DecorrLinear(
-						child, kappa=kappa, sample_frac=sample_frac, fuse=fuse, use_gain_scaling=use_gain_scaling,
-						use_demeaning=use_demeaning, demeaning_lr=kwargs.get("demeaning_lr")))
+					setattr(module, name, DecorrLinearNew(
+						child, kappa=kappa, sample_frac=sample_frac))
 
-				if name == "conv1d":
-					self.n_decorr_layers += 1 				
-					setattr(module, name, DecorrConv1d(
-						original_layer=child, use_gain_scaling=use_gain_scaling,
-						use_demeaning=use_demeaning, mode=conv_1d_mode, fuse=fuse, kappa=kappa, 
-						sample_frac=sample_frac, demeaning_lr=kwargs.get("demeaning_lr")))
+				# if name == "conv1d":
+				# 	self.n_decorr_layers += 1 				
+				# 	setattr(module, name, DecorrConv1d(
+				# 		original_layer=child, use_gain_scaling=use_gain_scaling,
+				# 		use_demeaning=use_demeaning, mode=conv_1d_mode, fuse=fuse, kappa=kappa, 
+				# 		sample_frac=sample_frac, demeaning_lr=kwargs.get("demeaning_lr")))
 
 
 		self.apply(partial(_create_decorr_matrices, 
