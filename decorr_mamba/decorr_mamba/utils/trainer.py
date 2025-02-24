@@ -8,9 +8,9 @@ import json
 import wandb
 
 from ..utils.helpers import MambaArgs, TrainingArgs
-from ..model.mamba import Mamba
-from ..model.decorrelation import DecorrMamba, apply_to_decorr
+from ..model.decorrelation import DecorrMamba, apply_to_decorr, DecorrLinear, DecorrConv1d
 from ..data.synthetics import InductionData
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 
 # os.environ["WANDB_SILENT"] = "true"
 
@@ -34,7 +34,8 @@ class MambaTrainer:
 				training and validation datasets
 	'''
 	def __init__(self, 
-			mamba_args: MambaArgs, train_args: TrainingArgs, model: Mamba, device: str):
+			mamba_args: MambaArgs, train_args: TrainingArgs, 
+			model: MambaLMHeadModel, device: str):
 
 		self.mamba_args = mamba_args
 		self.train_args = train_args
@@ -68,32 +69,13 @@ class MambaTrainer:
 			del self._param_groups["decay"][-1]
 
 	def train_sequence_steps(self, train_loader: DataLoader, val_loader: DataLoader, 
-		use_amp: bool,log_freq: int, n_val: int, train_backprop: bool=True, 
-		train_decorr: bool=True, save_checkpoints: bool=True, save_all_checkpoints: bool=False):
+		use_amp: bool, log_freq: int, n_val: int, train_backprop: bool=True, 
+		train_decorr: bool=True, save_checkpoints: bool=True):
 
 		''' 
 		Trains the model with the protocol specified in train_args. Trains based
 		on a fixed number of gradient descent steps, performs validation
 		at pre-defined points within the training loop. 
-
-		Args:
-			train_loader (DataLoader): PyTorch-compatible training dataloader
-			val_loader (DataLoader): PyTorch-compatible validation dataloader
-			train_backprop (bool, optional): turns on parameter updating for everything
-				other than decorrelation matrices, allows for sanity check
-				of decorrelation learning rule. Defaults to 'True'
-			train_decorr(bool, optional): turns on training for decorrelation matrices.
-				Defaults to 'True'
-			save_checkpoints (bool, optional): controls whether checkpoints are saved
-				during epochs. Defaults to 'True'
-			save_all_checkpoints (bool, optional): if saving checkpoints, controls
-				whether all epoch checkpoints are saved or just those where the loss
-				is better than the previous minimum. Defaults to 'False.	
-			use_amp (bool): determines if training with automatic mixed precision 
-				or not. 
-			log_freq (int): the number of steps between every log to wandb
-			n_val (int): the number of validation steps to perform at evenly-spaced
-				intervals throughout the entire training loop 
 
 		'''
 
@@ -102,12 +84,10 @@ class MambaTrainer:
 			print("Warning: not training backpropagation parameters!")
 		if not train_decorr:
 			print("Warning: not training decorrelation parameters!")
+		assert not (train_backprop and train_decorr), "Specify something to train"
+
 		if not isinstance(self.model, DecorrMamba) and train_decorr:
 			print("Warning: train_decorr set to True but model does not use decorrelation!")
-
-		if not save_checkpoints:
-			assert not save_all_checkpoints, \
-			"Cannot save all checkpoints, as save_checkpoints is set to False." 
 
 		if self.train_args.weight_decay is not None:
 			optimizer = torch.optim.AdamW(
@@ -144,26 +124,31 @@ class MambaTrainer:
 		epoch_train_ce_loss = 0.0
 		epoch_train_corr_loss = 0.0
 		epoch_train_whit_loss = 0.0
-		self.model.train()
+
+		if train_backprop:
+			self.model.train()
+		else:
+			self.model.eval()
 
 		for step in tqdm(range(self.train_args.n_steps)):
 
 			next_batch = next(train_loader)
-			optimizer.zero_grad()
+			in_seq = next_batch.to(self.device, non_blocking=True)
+			b = in_seq.shape[0]
 
-			if isinstance(self.model, DecorrMamba):
+			if train_backprop:
+				optimizer.zero_grad()
+			
+			if isinstance(self.model, DecorrMamba) and train_decorr:
 				self.model.reset_decorr()
 			
-			in_seq = next_batch.to(self.device, non_blocking=True)
-
 			with torch.amp.autocast(self.device.type, enabled=use_amp):
 				# shift input sequence by one token and compare
-				pred = self.model(in_seq[:,:-1]).logits
+				with torch.enable_grad() if train_backprop else torch.no_grad():
+					pred = self.model(in_seq[:,:-1]).logits
+				
 				target = in_seq[:,1:]
 				loss = criterion(pred, target)		
-
-			# del in_seq
-			# torch.cuda.empty_cache()
 
 			epoch_train_ce_loss += loss.item()
 
@@ -191,7 +176,8 @@ class MambaTrainer:
 				torch.nn.utils.clip_grad_norm_(self.model.parameters(), 
 											self.train_args.gradient_clip)
 			
-			# calculating update ratio information
+			# calculating update ratio information for the backprop-trained
+			# parameters
 			if step%log_freq == 0:
 				n_pars = 0
 				
@@ -200,7 +186,9 @@ class MambaTrainer:
 				max_update_ratio = -float("inf")
 
 				for _, param in self.model.named_parameters():
-					if param.grad is not None:
+					if param.grad is not None and not \
+						isinstance(param, DecorrLinear) and not \
+							isinstance(param, DecorrConv1d):
 
 						n_pars += 1
 						weight_norm = torch.norm(param).item()		
@@ -226,7 +214,9 @@ class MambaTrainer:
 			# update the decorrelation matrices AFTER standard backprop, 
 			# else training breaks!
 			if isinstance(self.model, DecorrMamba) and train_decorr:
-				self.model.update_decorr_matrices()		
+				self.model.reshape_decorr_inputs(b=b)
+				self.model.compute_decorr_grad_loss()
+				self.model.update_decorr_matrices()
 
 			if self.train_args.use_lr_sched:
 				# doesn't affect decorrelation lr
@@ -296,25 +286,13 @@ class MambaTrainer:
 						"val_corr_loss": total_val_corr_loss, 
 						"val_whit_loss": total_val_whit_loss})
 
-				if save_checkpoints and save_all_checkpoints:
+				if save_checkpoints:
 					torch.save({
 						"model_state": self.model.state_dict(),
 						"optimizer_state": optimizer.state_dict(),}, 
 						os.path.join(save_path, f"step_{step}.pth")) 
 					
 					wandb.save(os.path.join(save_path, f"step_{step}.pth"))
-
-				# saves only if performance improves, if training was 
-				# configured this way
-				if total_val_ce_loss < min_loss:
-					min_loss = total_val_ce_loss
-					if save_checkpoints and not save_all_checkpoints:
-						torch.save({
-							"model_state": self.model.state_dict(),
-							"optimizer_state": optimizer.state_dict(),}, 
-							os.path.join(save_path, f"step_{step}.pth"))
-						
-						wandb.save(os.path.join(save_path, f"step_{step}.pth"))
 
 
 	def train_sequence_epochs(self, train_loader: DataLoader, val_loader: DataLoader, 

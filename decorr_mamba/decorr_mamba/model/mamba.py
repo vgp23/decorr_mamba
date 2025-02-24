@@ -6,18 +6,15 @@ from ..utils.helpers import MambaArgs
 import math
 from functools import partial
 import json
-
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from copy import deepcopy
 
 class Mamba(nn.Module):
 	''' Full Mamba architecture '''
 	def __init__(self, model_args: MambaArgs):
 		super(Mamba, self).__init__()
 
-		print("USING NEW IMPLEMENTATION")
-
 		self.model_args = model_args
-
-		# TODO: implement decorrelation here as well?
 
 		self.embedding = nn.Embedding(model_args.vocab_size, model_args.D)
 
@@ -114,6 +111,53 @@ class Mamba(nn.Module):
 			new_key = new_key.replace('x_proj', 's6_block.to_BCdelta')    
 			new_key = new_key.replace('lm_head', 'logits')    
 			new_state_dict[new_key] = state_dict[key]
+		
+		model.load_state_dict(new_state_dict)
+
+		return model
+	
+	@staticmethod
+	def from_other(other: MambaLMHeadModel):
+		"""Convert a MambaLMHeadModel into this implementation, useful for
+		debugging/checking correct function
+	
+		"""
+		from transformers.utils import WEIGHTS_NAME, CONFIG_NAME
+		from transformers.utils.hub import cached_file
+		
+		new_state_dict = {}
+		for key in other.state_dict():
+			new_key = key.replace('backbone.', '')
+			new_key = new_key.replace('mixer', 'block')
+			new_key = new_key.replace('D', 's6_block.D')
+			new_key = new_key.replace('A_log', 's6_block.log_minus_A')
+			new_key = new_key.replace('norm_f', 'rms')
+			new_key = new_key.replace('norm', 'rms')
+			new_key = new_key.replace('dt_proj', 's6_block.delta_upscale')
+			new_key = new_key.replace('x_proj', 's6_block.to_BCdelta')    
+			new_key = new_key.replace('lm_head', 'logits')    
+			new_state_dict[new_key] = other.state_dict()[key]
+
+		model_args = MambaArgs(
+			D=other.config.d_model,
+			n_layers=other.config.n_layer,
+			vocab_size=other.config.vocab_size,
+			N=16,
+			pad_vocab_size_multiple=8,
+			device="cuda",
+			expansion_factor=2,
+			conv_1d_size=4,
+			conv_bias=True,
+			general_bias=False,
+			delta_init="random",
+			delta_scale=1.0,
+			delta_rank="auto",
+			delta_min = 0.001,
+			delta_max=0.1,
+			delta_init_floor=0.0001
+		)
+
+		model = Mamba(model_args)
 		
 		model.load_state_dict(new_state_dict)
 
