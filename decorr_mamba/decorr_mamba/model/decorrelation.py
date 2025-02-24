@@ -308,14 +308,17 @@ class DecorrMamba(MambaLMHeadModel):
 
 		self.apply(_fix)
 	
-	def reset_decorr(self):
+	def reset_decorr(self, re_fuse: bool = True):
 		''' 
 		Resets gradients and losses of decorrelation layers after parameter
 		updates. Also resets the mean losses computed across all decorrelation
-		layers.
+		layers, and re-fuses the weight + decorrelation matrices for the forward
+		pass
 		'''
 
 		self.apply_to_decorr(lambda x: x.reset())
+		if re_fuse:
+			self.fuse_decorr()
 		self.mean_corr_loss = 0
 		self.mean_whit_loss = 0
 
@@ -404,6 +407,27 @@ class DecorrMamba(MambaLMHeadModel):
 			module.decorr_layer.data = unscaled_update
 
 		self.apply_to_decorr(_update_decorr_matrices)
+	
+	def fuse_decorr(self):
+		''' Creates the fused backprop weight + decorrelation matrix after 
+		the update of decorrelation matrices'''
+		def _fuse_decorr(module):
+			if isinstance(module, DecorrLinear):
+				fused_weight = TrackedParameter(
+					module.original_weight @ module.decorr_layer, 
+					requires_grad=False)
+				module.register_parameter("weight", fused_weight)
+		
+			else: # Conv1d
+				fused_weight = torch.unsqueeze(
+					einsum(
+						module.decorr_layer.data, torch.squeeze(module.original_weight.data),
+						'd dummy conv_1d_size, d dummy -> d conv_1d_size'), 1)
+				fused_weight = TrackedParameter(fused_weight, requires_grad=False)
+				module.register_parameter("weight", fused_weight)
+
+		self.apply_to_decorr(_fuse_decorr)
+
 
 	def apply_to_decorr(self, f):
 		"Used for applying simple functions to all of a model's decorrelated layers"

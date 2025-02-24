@@ -134,7 +134,9 @@ class MambaTrainer:
 
 			next_batch = next(train_loader)
 			in_seq = next_batch.to(self.device, non_blocking=True)
-			b = in_seq.shape[0]
+			b = in_seq.shape[0] # Needed for decorr input reshaping 
+
+			self.model.apply_to_decorr(lambda x: print(x.decorr_layer))
 
 			if train_backprop:
 				optimizer.zero_grad()
