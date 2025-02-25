@@ -263,23 +263,31 @@ class DecorrMamba(MambaLMHeadModel):
 			super(DecorrMamba, self).__init__(**factory_kwargs)
 
 		self.n_decorr_layers = 0 # used for averaging the decorr losses later
-		# used for referencing decorrelation layers directly
+		# used for referencing decorrelation layers directly without looping
+		# over complete model structure
 		self.decorr_layers = nn.ModuleDict()
+		self.decorr_module_id = 0
 
 		def _create_decorr_matrices(module):
 			''' 
 			Used to recursively traverse model and create decorrelation matrices 
 			in pre-defined places
 			'''
+
 			for name, child in module.named_children():
 				if name == "in_proj" or name == "out_proj" or name == "x_proj":
 					self.n_decorr_layers += 1
 					setattr(module, name, DecorrLinear(original_layer=child))
-					self.decorr_layers
+					self.decorr_layers[f"{self.decorr_module_id}_{name}"] = \
+						getattr(module, name)
+					self.decorr_module_id +=1
 
 				if name == "conv1d":
 					self.n_decorr_layers += 1 				
 					setattr(module, name, DecorrConv1d(original_layer=child))
+					self.decorr_layers[f"{self.decorr_module_id}_{name}"] = \
+						getattr(module, name)
+					self.decorr_module_id +=1
 
 		self.apply(_create_decorr_matrices)
 
@@ -433,13 +441,8 @@ class DecorrMamba(MambaLMHeadModel):
 
 	def apply_to_decorr(self, f):
 		"Used for applying simple functions to all of a model's decorrelated layers"
-		def _apply_to_decorr(module):
-			for child in module.children():
-				if isinstance(child, DecorrLinear) or isinstance(child, DecorrConv1d):
-					f(child)
-
-		self.apply(_apply_to_decorr)
-
+		for key in self.decorr_layers.keys():
+			f(self.decorr_layers[key])
 
 
 	
