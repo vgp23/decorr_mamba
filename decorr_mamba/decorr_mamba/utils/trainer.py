@@ -8,7 +8,7 @@ import json
 import wandb
 
 from ..utils.helpers import MambaArgs, TrainingArgs
-from ..model.decorrelation import DecorrMamba, apply_to_decorr, DecorrLinear, DecorrConv1d
+from ..model.decorrelation import DecorrMamba, DecorrLinear, DecorrConv1d
 from ..data.synthetics import InductionData
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 
@@ -35,12 +35,12 @@ class MambaTrainer:
 	'''
 	def __init__(self, 
 			mamba_args: MambaArgs, train_args: TrainingArgs, 
-			model: MambaLMHeadModel, device: str):
+			model: MambaLMHeadModel):
 
 		self.mamba_args = mamba_args
 		self.train_args = train_args
 		self.model = model
-		self.device = device
+		self.device = self.model.lm_head.weight.device
 
 		def _add_param_to_groups(module, param_groups):
 			'''
@@ -119,7 +119,8 @@ class MambaTrainer:
 		scaler = torch.amp.GradScaler(self.device.type, enabled=use_amp)
 
 		validate_every = int(self.train_args.n_steps/n_val)
-		train_loader = iter(train_loader)
+		train_iterator = iter(train_loader)
+
 		# "epoch" isn't quite correct here, but alas
 		epoch_train_ce_loss = 0.0
 		epoch_train_corr_loss = 0.0
@@ -130,13 +131,19 @@ class MambaTrainer:
 		else:
 			self.model.eval()
 
-		for step in tqdm(range(self.train_args.n_steps)):
+		for step in tqdm(range(1, self.train_args.n_steps+1)):
+			# an infinite loop for the fixed number of gradient descent 
+			# steps
+			try:
+				next_batch = next(train_iterator)
+			except StopIteration:
+				train_iterator = iter(train_loader)  # Reset the iterator
+				next_batch = next(train_iterator)
 
-			next_batch = next(train_loader)
 			in_seq = next_batch.to(self.device, non_blocking=True)
 			b = in_seq.shape[0] # Needed for decorr input reshaping 
 
-			self.model.apply_to_decorr(lambda x: print(x.decorr_layer))
+			# self.model.apply_to_decorr(lambda x: print(x.decorr_layer))
 
 			if train_backprop:
 				optimizer.zero_grad()
@@ -150,7 +157,7 @@ class MambaTrainer:
 					pred = self.model(in_seq[:,:-1]).logits
 				
 				target = in_seq[:,1:]
-				loss = criterion(pred, target)		
+				loss = criterion(pred.permute(0, 2, 1), target)		
 
 			epoch_train_ce_loss += loss.item()
 
@@ -158,8 +165,13 @@ class MambaTrainer:
 				wandb.log({"train_ce_loss": loss.item()})							
 										
 			if isinstance(self.model, DecorrMamba):
-				# calculating mean losses across all decorrelation layers
-				self.model.mean_decorr_losses()			
+				# calculating gradients and losses of decorrelation layers,
+				# then averaging them across the architecture
+			
+				self.model.reshape_decorr_inputs(b=b)
+				self.model.compute_decorr_grad_loss()				
+				self.model.mean_decorr_losses()		
+					
 				train_corr_loss = self.model.mean_corr_loss.item()
 				train_whit_loss = self.model.mean_whit_loss.item()
 				epoch_train_corr_loss += train_corr_loss
@@ -180,7 +192,8 @@ class MambaTrainer:
 			
 			# calculating update ratio information for the backprop-trained
 			# parameters
-			if step%log_freq == 0:
+			if step%log_freq == 0 and train_backprop:
+				
 				n_pars = 0
 				
 				mean_update_ratio = 0.0
@@ -212,17 +225,14 @@ class MambaTrainer:
 			if train_backprop:
 				scaler.step(optimizer)
 				scaler.update()
+				if self.train_args.use_lr_sched:
+					# doesn't affect decorrelation lr
+					scheduler.step()
 
 			# update the decorrelation matrices AFTER standard backprop, 
 			# else training breaks!
 			if isinstance(self.model, DecorrMamba) and train_decorr:
-				self.model.reshape_decorr_inputs(b=b)
-				self.model.compute_decorr_grad_loss()
 				self.model.update_decorr_matrices()
-
-			if self.train_args.use_lr_sched:
-				# doesn't affect decorrelation lr
-				scheduler.step()
 
 			# Condition checking if validate_every number of gradient descent
 			# steps have happened
@@ -256,10 +266,15 @@ class MambaTrainer:
 					with torch.amp.autocast(self.device.type, enabled=use_amp):	
 						
 						for next_batch in val_loader:
+							if isinstance(self.model, DecorrMamba):
+								# only resets the losses for the decorrelation layers
+								# and the model
+								self.model.reset_decorr(re_fuse=False)
+
 							in_seq = next_batch.to(self.device, non_blocking=True)
-							pred = self.model(in_seq[:,:-1])
+							pred = self.model(in_seq[:,:-1]).logits
 							target = in_seq[:,1:]
-							loss = criterion(pred, target)
+							loss = criterion(pred.permute(0,2,1), target)
 
 							# if loss.isnan():
 							# 	print(f"Loss in batch {i} returned nan!")
@@ -268,6 +283,10 @@ class MambaTrainer:
 							total_val_ce_loss += loss.item()
 
 							if isinstance(self.model, DecorrMamba):
+								# only compute losses of decorr matrices,
+								# not the associated gradients
+								self.model.reshape_decorr_inputs(b=b)
+								self.model.compute_decorr_grad_loss(compute_grad=False)				
 								self.model.mean_decorr_losses()
 								val_corr_loss = self.model.mean_corr_loss.item()
 								val_whit_loss = self.model.mean_whit_loss.item()
@@ -418,7 +437,7 @@ class MambaTrainer:
 												self.train_args.gradient_clip)
 				
 				# calculating update ratio information
-				if i%log_freq == 0:
+				if i%log_freq == 0 and train_backprop:
 					n_pars = 0
 					
 					mean_update_ratio = 0.0
@@ -448,15 +467,15 @@ class MambaTrainer:
 				if train_backprop:
 					scaler.step(optimizer)
 					scaler.update()
+					if self.train_args.use_lr_sched:
+						# doesn't affect decorrelation lr
+						scheduler.step()
 
 				# update the decorrelation matrices AFTER standard backprop, 
 				# else training breaks!
 				if isinstance(self.model, DecorrMamba) and train_decorr:
 					self.model.update_decorr_matrices()		
 
-				if self.train_args.use_lr_sched:
-					# doesn't affect decorrelation lr
-					scheduler.step()
 
 			epoch_train_ce_loss /= len(train_loader)		
 			epoch_train_corr_loss /= len(train_loader)
@@ -663,7 +682,7 @@ class MambaTrainer:
 												self.train_args.gradient_clip)
 				
 				# calculating update ratio information
-				if i%log_freq == 0:
+				if i%log_freq == 0 and train_backprop:
 					n_pars = 0
 					
 					mean_update_ratio = 0.0
@@ -693,15 +712,15 @@ class MambaTrainer:
 				if train_backprop:
 					scaler.step(optimizer)
 					scaler.update()
+					if self.train_args.use_lr_sched:
+						# doesn't affect decorrelation lr
+						scheduler.step()
 
 				# update the decorrelation matrices AFTER standard backprop, 
 				# else training breaks!
 				if isinstance(self.model, DecorrMamba) and train_decorr:
 					self.model.update_decorr_matrices()		
 
-				if self.train_args.use_lr_sched:
-					# doesn't affect decorrelation lr
-					scheduler.step()
 
 			epoch_train_ce_loss /= n_epoch_steps		
 			epoch_train_corr_loss /= n_epoch_steps
