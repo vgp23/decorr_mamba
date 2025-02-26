@@ -148,8 +148,11 @@ class MambaTrainer:
 			if train_backprop:
 				optimizer.zero_grad()
 			
-			if isinstance(self.model, DecorrMamba) and train_decorr:
-				self.model.reset_decorr()
+			# do this regardless of whether we're training these parameters or 
+			# not, because the reset is necessary to compute losses correctly
+			# during a forward pass
+			if isinstance(self.model, DecorrMamba):
+				self.model.reset_decorr(re_fuse=train_decorr)
 			
 			with torch.amp.autocast(self.device.type, enabled=use_amp):
 				# shift input sequence by one token and compare
@@ -169,7 +172,7 @@ class MambaTrainer:
 				# then averaging them across the architecture
 			
 				self.model.reshape_decorr_inputs(b=b)
-				self.model.compute_decorr_grad_loss()				
+				self.model.compute_decorr_grad_loss(compute_grad=train_decorr)		
 				self.model.mean_decorr_losses()		
 					
 				train_corr_loss = self.model.mean_corr_loss.item()

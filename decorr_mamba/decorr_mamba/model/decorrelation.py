@@ -169,6 +169,7 @@ class DecorrLinear(nn.Linear):
 			torch.eye(self.in_features).to(self.weight.device), requires_grad=False)
 
 		self.register_parameter("original_weight", nn.Parameter(self.weight))
+		print(self.original_weight.requires_grad)
 		# delete self.weight, because we'll be overwriting it later
 		del self._parameters["weight"]
 
@@ -265,8 +266,7 @@ class DecorrMamba(MambaLMHeadModel):
 		self.n_decorr_layers = 0 # used for averaging the decorr losses later
 		# used for referencing decorrelation layers directly without looping
 		# over complete model structure
-		self.decorr_layers = nn.ModuleDict()
-		self.decorr_module_id = 0
+		self.decorr_layers = []
 
 		def _create_decorr_matrices(module):
 			''' 
@@ -278,16 +278,12 @@ class DecorrMamba(MambaLMHeadModel):
 				if name == "in_proj" or name == "out_proj" or name == "x_proj":
 					self.n_decorr_layers += 1
 					setattr(module, name, DecorrLinear(original_layer=child))
-					self.decorr_layers[f"{self.decorr_module_id}_{name}"] = \
-						getattr(module, name)
-					self.decorr_module_id +=1
+					self.decorr_layers.append(getattr(module, name))
 
 				if name == "conv1d":
 					self.n_decorr_layers += 1 				
 					setattr(module, name, DecorrConv1d(original_layer=child))
-					self.decorr_layers[f"{self.decorr_module_id}_{name}"] = \
-						getattr(module, name)
-					self.decorr_module_id +=1
+					self.decorr_layers.append(getattr(module, name))
 
 		self.apply(_create_decorr_matrices)
 
@@ -441,8 +437,8 @@ class DecorrMamba(MambaLMHeadModel):
 
 	def apply_to_decorr(self, f):
 		"Used for applying simple functions to all of a model's decorrelated layers"
-		for key in self.decorr_layers.keys():
-			f(self.decorr_layers[key])
+		for layer in self.decorr_layers:
+			f(layer)
 
 
 	
