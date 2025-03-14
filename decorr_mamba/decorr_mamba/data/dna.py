@@ -7,11 +7,20 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 class DNADataset(Dataset):
-    def __init__(
-            self, fasta_file, bed_file, split, L=2**17, 
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        # Collect all sequence file paths recursively
+        self.data = torch.load(data_dir, mmap=True, weights_only=False)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+    @staticmethod
+    def make_sequences(fasta_file, bed_file, split, L=2**17, 
             include_lowercase=False):
-        
-        self.split = split
         
         # import genome
         with gzip.open(fasta_file, 'rt') as handle:
@@ -33,14 +42,14 @@ class DNADataset(Dataset):
 
         # make distinction between repeats and main coding regions
         if include_lowercase:
-            self.NUC_TO_INT = {'A': 0, 'T': 1, 'G': 2, 'C': 3, 'N': 4,
+            NUC_TO_INT = {'A': 0, 'T': 1, 'G': 2, 'C': 3, 'N': 4,
                                'a': 5, 't': 6, 'g': 7, 'c': 8}
         else:
-            self.NUC_TO_INT = {'A': 0, 'T': 1, 'G': 2, 'C': 3, 'N': 4,
+            NUC_TO_INT = {'A': 0, 'T': 1, 'G': 2, 'C': 3, 'N': 4,
                                'a': 0, 't': 1, 'g': 2, 'c': 3}
                         
-        self.segments = []
-
+        segments = []
+        print("Making sequences:")
         # if L is shorter than or equal 2^17, take each of the pre-defined segments
         # and divide them into as many non-overlapping sub-segments as possible
         if L <= 2**17:
@@ -53,50 +62,49 @@ class DNADataset(Dataset):
                 for i in range(0, 2**17, L):
                     if i+L <= 2**17:
                         seq_tensor = torch.tensor(
-                            [self.NUC_TO_INT.get(base, 4) for base in full_seq[i:i+L]], 
-                            dtype=torch.long)        
-                        self.segments.append(seq_tensor)
+                            [NUC_TO_INT.get(base, 4) for base in full_seq[i:i+L]], 
+                            dtype=torch.uint8)        
+                        segments.append(seq_tensor)
         # if L is larger than 2^17, create two samples for each pre-defined segment,
         # one which starts where the pre-defined segment begins, and another which 
         # ends where the pre-defined segment ends
         else:
             for chrom, (start_idx, end_idx) in zip(chrom_keys, idxs):
                 seq_1_tensor = torch.tensor(
-                    [self.NUC_TO_INT.get(base, 4) for base in 
+                    [NUC_TO_INT.get(base, 4) for base in 
                         str(genome[chrom].seq[start_idx:start_idx+L])], 
-                    dtype=torch.long)
-                self.segments.append(seq_1_tensor)
+                    dtype=torch.uint8)
+                segments.append(seq_1_tensor)
                 # we can't make the second sample if this is close to the beginning
                 # of the chromosome, there may not be enough base pairs available
                 # before the start index
                 if end_idx - L >= 0:
                     seq_2_tensor = torch.tensor(
-                        [self.NUC_TO_INT.get(base, 4) for base in 
+                        [NUC_TO_INT.get(base, 4) for base in 
                             str(genome[chrom].seq[end_idx-L:end_idx])], 
-                        dtype=torch.long)
-                    self.segments.append(seq_2_tensor)
+                        dtype=torch.uint8)
+                    segments.append(seq_2_tensor)
+        
+        # Convert this list to a giant tensor
+        tensor_data = torch.stack(segments)
 
-    def __len__(self):
-        return len(self.segments)  
-
-    def __getitem__(self, idx):
-        return self.segments[idx] 
+        # make necessary directories
+        parent_dir = f"hg38_length_{L}_include_lowercase_{include_lowercase}"
+        os.makedirs(parent_dir, 
+                    exist_ok=True)
+        
+        # save!
+        torch.save(tensor_data, os.path.join(parent_dir, f"{split}.pt"))
 
 if __name__ == "__main__":
     split = "train"
     L = 1024
     include_lowercase = False
 
-    dataset_dir = os.path.join(os.path.expanduser("~"), "thesis_work", "datasets", "dna")
     bed_file = "data_human_sequences.bed"
-    fasta_file = os.path.join("hg38.fa.gz")
+    fasta_file = os.path.join("data", "hg38.fa.gz")
 
-
-    dataset = DNADataset(os.path.join(dataset_dir, fasta_file), 
-                         os.path.join(dataset_dir, bed_file), split=split, 
+    DNADataset.make_sequences(fasta_file, bed_file, split=split, 
                         L=L, include_lowercase=include_lowercase)
-
-    torch.save(dataset, os.path.join(dataset_dir, "hg38_torch"
-            f"hg38_length_{L}_include_lowercase_{include_lowercase}_split_{split}.pt"))
     
 
