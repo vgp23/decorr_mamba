@@ -175,36 +175,6 @@ class MambaTrainer:
 			if step%log_freq == 0:
 				wandb.log({"train_ce_loss": loss.item(), 
 			   				"train_ppl": ppl}, step=step)					
-			
-			if isinstance(self.model, DecorrMamba):
-				# calculating gradients and losses of decorrelation layers,
-				# then averaging them across the architecture
-			
-				# pre_reshape_time = time.time()
-				self.model.reshape_decorr_inputs(b=b)
-				# post_reshape_time = time.time() - pre_reshape_time
-
-				# pre_grad_time = time.time()
-				self.model.compute_decorr_grad_loss(compute_grad=train_decorr, b=b)	
-				# post_grad_time = time.time() - pre_grad_time
-
-				# pre_mean_time = time.time()	
-				self.model.mean_decorr_losses()	
-				# post_mean_time = time.time() - pre_mean_time	
-					
-				train_corr_loss = self.model.mean_corr_loss
-				train_whit_loss = self.model.mean_whit_loss
-
-				if train_corr_loss is not None:
-					train_corr_loss = train_corr_loss.item()
-					epoch_train_corr_loss += train_corr_loss
-				if train_whit_loss is not None:
-					train_whit_loss = train_whit_loss.item()
-					epoch_train_whit_loss += train_whit_loss
-
-				if step%log_freq == 0:
-					wandb.log({"train_corr_loss": train_corr_loss, 
-							"train_whit_loss": train_whit_loss}, step=step)	
 
 			if train_backprop:
 				scaler.scale(loss).backward()
@@ -246,20 +216,51 @@ class MambaTrainer:
 			# 				"update_ratio/min": min_update_ratio,
 			# 				"update_ratio/max": max_update_ratio}, step=step)									
 
-		
 			if train_backprop:
 				scaler.step(optimizer)
 				scaler.update()
 				if self.train_args.use_lr_sched:
 					# doesn't affect decorrelation lr
 					scheduler.step()
-
+			
 			# update the decorrelation matrices AFTER standard backprop, 
 			# else training breaks!
-			if isinstance(self.model, DecorrMamba) and train_decorr:
-				# pre_update_time = time.time()
-				self.model.update_decorr_matrices()
-				# post_update_time = time.time() - pre_update_time
+			if isinstance(self.model, DecorrMamba):
+				# calculating gradients and losses of decorrelation layers,
+				# then averaging them across the architecture
+			
+				# pre_reshape_time = time.time()
+				self.model.reshape_decorr_inputs(b=b)
+				# post_reshape_time = time.time() - pre_reshape_time
+
+				pre_grad_time = time.time()
+				self.model.compute_decorr_grad_loss(compute_grad=train_decorr, b=b)	
+				post_grad_time = time.time() - pre_grad_time
+
+				# pre_mean_time = time.time()	
+				self.model.mean_decorr_losses()	
+				# post_mean_time = time.time() - pre_mean_time	
+				
+				pre_log_time = time.time()
+				train_corr_loss = self.model.mean_corr_loss
+				train_whit_loss = self.model.mean_whit_loss
+
+				if train_corr_loss is not None:
+					train_corr_loss = train_corr_loss.item()
+					epoch_train_corr_loss += train_corr_loss
+				if train_whit_loss is not None:
+					train_whit_loss = train_whit_loss.item()
+					epoch_train_whit_loss += train_whit_loss
+				if step%log_freq == 0:
+					wandb.log({"train_corr_loss": train_corr_loss, 
+							"train_whit_loss": train_whit_loss}, step=step)	
+					
+				post_log_time = time.time() - pre_log_time
+				print(f"Grad time: {post_grad_time}")
+				print(f"Logging time: {post_log_time}")
+
+				if train_decorr:
+					self.model.update_decorr_matrices()
 
 			# Condition checking if validate_every number of gradient descent
 			# steps have happened

@@ -46,30 +46,38 @@ class DecorrLoss(nn.Module):
 		assert kappa is not None, "Specify kappa for loss and gradient computation"
 		assert kappa <= 1.0 and kappa >= 0.0, "kappa must be between 0 and 1"
 
-
 		# used for all modes where the decorrelation layer has only a single
 		# matrix to train
 		if not batched:
 			# collapse input across the batch and length dimensions
 			_, _, d = x.shape
 			x = x.reshape(-1, d)
+
 			# compute the individual loss elements
-			D = torch.diag_embed(x**2)
-
-			# No point in calculating these if they're note used
+			D = x**2
+			# No point in calculating these if they're not used
 			if kappa == 0.0:
-				V = 0
+				V = None
 			else:
-				V = D - torch.eye(d, device=x.device)
+				V = D - torch.ones(d, device=x.device)
 
-			xx_t = einsum(x, x, 
-				'n_samples x, n_samples x_t -> n_samples x x_t')
+			xx_t = x.unsqueeze(-1) * x.unsqueeze(-2)
 
-			C = xx_t - D
+			C = xx_t.clone()
+			C.diagonal(dim1=-2, dim2=-1).sub_(D)
 
 			# compute the actual gradient, if applicable
 			if compute_grad:
-				grad = torch.mean(((1-kappa)*C + kappa*V), dim=0)
+				if kappa == 0:
+					grad = torch.mean(C, dim=0)
+				elif kappa == 1:
+					# TODO: implement a nicer way of dealing with this to
+					# avoid unnecessary operations
+					grad = torch.diag_embed(torch.mean(V, dim=0))
+				else:
+					unaveraged = (1-kappa) * C.clone()
+					unaveraged.diagonal(dim1=-2, dim2=-1).add_(kappa*V)
+					grad = torch.mean(unaveraged, dim=0)
 			else:
 				grad = None
 
@@ -86,22 +94,31 @@ class DecorrLoss(nn.Module):
 			x = x.transpose(0, 1)
 
 			# compute the individual loss elements
-			D = torch.diag_embed(x**2)
+			D = x**2
 
 			if kappa == 0.0:
-				V = 0
+				V = None
 			else:
-				V = D - torch.eye(decorr_matrix_size, device=x.device)
+				V = D - torch.ones(decorr_matrix_size, device=x.device)
 
 			xx_t = einsum(x, x, 
 				'd n_samples x, d n_samples x_t -> d n_samples x x_t')
 
 			# (D, n_samples, decorr_matrix_size, decorr_matrix_size)
-			C = xx_t - D
+			C = xx_t.clone()
+			C.diagonal(dim1=-2, dim2=-1).sub_(D)
 
 			# compute the actual gradients, if applicable
 			if compute_grad:
-				grad = torch.mean(((1-kappa)*C + kappa*V), dim=1)
+				if kappa == 0:
+					grad = torch.mean(C, dim=1)
+				elif kappa == 1:
+					# TODO: implement less wasteful gradient updates here
+					grad = torch.diag_embed(torch.mean(V, dim=1))
+				else:
+					unaveraged = (1-kappa) * C.clone()
+					unaveraged.diagonal(dim1=-2, dim2=-1).add_(kappa*V)
+					grad = torch.mean(unaveraged, dim=1)
 			else:
 				grad = None
 
@@ -124,50 +141,103 @@ class DecorrLoss(nn.Module):
 		return grad, corr_loss, whit_loss
 
 		
-class TrackingTensor(torch.Tensor):
+class DecorrTensor(torch.Tensor):
 
-	def __new__(cls, tensor, parent_layer):
+	def __new__(cls, tensor, parent_layer, 
+			 b=None, d_inner=None, d_model=None):
 		if not isinstance(tensor, torch.Tensor):
 			raise TypeError("Expected a torch.Tensor")
 		# Create a new instance that shares the same storage as the original tensor
 		instance = tensor.as_subclass(cls)
 		instance.parent_layer = parent_layer
+		instance.b = b
+		instance.d_inner = d_inner
+		instance.d_model = d_model
 		return instance
 
 	def __matmul__(self, other):
 		"""Intercepts matrix multiplication to log the input."""
-		self.parent_layer.inputs.append(other.clone().detach())
+
+		assert self.parent_layer.inputs is None, \
+		f"Attempting to overwrite inputs for layer {self.parent_layer}"
+		self.parent_layer.inputs = other.clone().detach()
+
 		result = super().__matmul__(other)
 		return result.as_subclass(torch.Tensor)
 
 	def __rmatmul__(self, other):
 		"""Tracks all tensors that multiplied self: x @ W"""
-		self.parent_layer.inputs.append(other.clone().detach()) 
+
+		assert self.parent_layer.inputs is None, \
+		f"Attempting to overwrite inputs for layer {self.parent_layer}"
+		self.parent_layer.inputs = other.clone().detach()
 		result = super().__rmatmul__(other)	
 		return result.as_subclass(torch.Tensor)
 
 	def transpose(self, dim0, dim1):
 		""" Ensures transposition is also tracked """
 		# Make a new parameter, morifying the same inputs list as the original
-		transposed_parameter = TrackingTensor(
+		transposed_parameter = DecorrTensor(
 			super().transpose(dim0, dim1), self.parent_layer)
 		return transposed_parameter
 
 	@property
 	def T(self):
 		""" Handles W.T so it retains tracking """
-		return self.transpose(0, 1)		
+		return self.transpose(0, 1)	
+
+	def decorr_operations(self):
+		if self.parent_layer.training or self.parent_layer.compute_loss:
+
+			if isinstance(self.parent_layer, DecorrLinear):
+				self.parent_layer.reshape_decorr_inputs(
+					b=self.b, d_inner=self.d_inner, d_model=self.d_model)
+			
+			
+class _DecorrLayer(nn.Module):
+	''' Wrapper class providing simple functionality to all decorrelation
+		layers. '''
+	def __init__(self, compute_loss):
+		# this tracks inputs during the standard forward pass
+		self.register_forward_hook(self.track_weight_input)
+		self.inputs = None
+
+		self.corr_loss = None
+		self.whit_loss = None
+		self.decorr_grad = None
+		self.compute_loss = compute_loss
 	
+	def track_weight_input(self, module, input, output):
+		self.inputs.append(input[0].clone().detach())
 
-class DecorrLinear(nn.Linear):
-	def __init__(self, original_layer: nn.Linear = None, **factory_kwargs):
+	def reset(self, re_fuse=True):
+		self.corr_loss = None
+		self.whit_loss = None
+		self.decorr_grad = None
+		self.inputs = None
 
+		if re_fuse:
+			self.fuse_decorr()
+
+	def update_decorr_matrices(self, decorr_lr):
+		assert self.grad is not None, "Gradient not computed"
+		with torch.no_grad():
+			self.decorr_layer -= decorr_lr * (self.grad @ self.decorr_layer)
+		
+	
+class DecorrLinear(_DecorrLayer):
+	def __init__(self, original_layer: nn.Linear = None, 
+			  reshape_type: str = None, compute_loss: bool = True,
+			    **factory_kwargs):
+		super().__init__(compute_loss)
 		# allows layer to be created on top of existing one, or made from
-		# scratch
+		# scratch. Doesn't outright extend nn.Linear because we want some
+		# functions common to all decorrelation module subtypes, but some 
+		# linear-specific functionality might be needed later on. 
 		if original_layer is not None:
 			self.__dict__.update(original_layer.__dict__)
 		else:
-			super(DecorrLinear, self).__init__(**factory_kwargs)
+			self.__dict__.update(nn.Linear(**factory_kwargs).__dict__)
 
 		self.decorr_layer = nn.Parameter(
 			torch.eye(self.in_features).to(self.weight.device), requires_grad=False)
@@ -175,40 +245,62 @@ class DecorrLinear(nn.Linear):
 		# Fuses decorrelation + weight matrix, made available for manual
 		# matrix multiplications in forward pass
 		self.fuse_decorr()
+		# dictates how the reshaping of captured input tensors happens
+		self.reshape_type = reshape_type
 
-		# this tracks inputs during the standard forward pass
-		self.register_forward_hook(self.track_weight_input)
-		self.inputs = []
 
-		self.corr_loss = None
-		self.whit_loss = None
-		self.decorr_grad = None
-
-	def track_weight_input(self, module, input, output):
-		self.inputs.append(input[0].clone().detach())
-	
 	def forward(self, x):
 		# forward hook takes care of input tracking, don't want a TrackedTensor
 		# here. 
 		return linear(x, self.fused_weight.as_subclass(torch.Tensor), self.bias)
 
-	def reset(self):
-		self.corr_loss = None
-		self.whit_loss = None
-		self.decorr_grad = None
-		self.inputs = []
-
 	def fuse_decorr(self):
-		self.fused_weight = TrackingTensor(self.weight @ self.decorr_layer, 
+		self.fused_weight = DecorrTensor(self.weight @ self.decorr_layer, 
 								parent_layer=self)
+		
+	def reshape_decorr_inputs(self, b, d_inner, d_model):
+		# reshapes the captured inputs to these layers so that gradient
+		# computation can be performed
+		if self.reshape_type == "in_proj" and self.inputs is not None:
+			self.inputs = self.inputs.reshape(
+				(d_model, b, -1)).permute(1, 2, 0)
+			
+		elif self.reshape_type == "x_proj" and self.inputs is not None:
+			self.inputs = self.inputs.reshape(
+				(b, -1, d_inner))	
+			
+	def compute_decorr_grad_loss(self, 
+					indices, kappa, loss_module, compute_grad, compute_loss, d_inner):
+		
+		with torch.no_grad():
+			assert len(self.inputs) == 1, \
+			f"No/too many inputs found for layer {self}"
 
-class DecorrConv1d(nn.Conv1d):
-	def __init__(self, original_layer: nn.Conv1d = None, **factory_kwargs):
+			# select a subset of the logged inputs
+			subset = torch.index_select(self.inputs[0], 0, indices)
 
+			# forward pass this through the decorrelation matrix
+			decorr_out = F.linear(subset, self.decorr_layer)
+
+			grad, corr_loss, whit_loss = loss_module(
+				decorr_out, kappa, compute_grad, compute_loss, batched=False)
+
+			self.grad = grad
+			self.corr_loss = corr_loss
+			self.whit_loss = whit_loss	
+
+class DecorrConv1d(_DecorrLayer):
+	def __init__(self, original_layer: nn.Conv1d = None, 
+			  compute_loss: bool = True, **factory_kwargs):
+		super().__init__(compute_loss)
+		# allows layer to be created on top of existing one, or made from
+		# scratch. Doesn't outright extend nn.Conv1d because we want some
+		# functions common to all decorrelation module subtypes, but some 
+		# convolutional-specific functionality might be needed later on. 
 		if original_layer is not None:
 			self.__dict__.update(original_layer.__dict__)
 		else:
-			super(DecorrConv1D, self).__init__(**factory_kwargs)
+			self.__dict__.update(nn.Conv1d(**factory_kwargs).__dict__)
 
 		# (in_channels, kernel_size, kernel_size)
 		all_matrices = torch.eye(self.kernel_size[0]).unsqueeze(0).repeat(
@@ -220,43 +312,59 @@ class DecorrConv1d(nn.Conv1d):
 		# matrix multiplications in forward pass
 		self.fuse_decorr()
 
-		# this tracks inputs during the standard forward pass
-		self.register_forward_hook(self.track_weight_input)
-		self.inputs = []
-
-		self.corr_loss = None
-		self.whit_loss = None
-		self.decorr_grad = None
-
-	def track_weight_input(self, module, input, output):
-		self.inputs.append(input[0].clone().detach())
-	
 	def forward(self, x):
 		# forward hook takes care of input tracking, don't want a TrackedTensor
 		# here. 	
 		return conv1d(x, self.fused_weight.as_subclass(torch.Tensor), self.bias, 
 				self.stride, self.padding, self.dilation, self.groups)
 
-	def reset(self):
-		self.corr_loss = None
-		self.whit_loss = None
-		self.decorr_grad = None
-		self.inputs = []
-
 	def fuse_decorr(self):
-		self.fused_weight = TrackingTensor(
+		self.fused_weight = DecorrTensor(
 			torch.unsqueeze(
 					einsum(
 						self.decorr_layer.data, torch.squeeze(self.weight.data),
 						'd dummy conv_1d_size, d dummy -> d conv_1d_size'), 
 						1), 
 						parent_layer=self)
+		
+	def compute_decorr_grad_loss(self, 
+					indices, kappa, loss_module, compute_grad, compute_loss, d_inner):
+		
+		with torch.no_grad():
+			assert len(self.inputs) is not None, \
+				f"No inputs captured for layer {self}"
+
+			# select a subset of the logged inputs
+			subset = torch.index_select(self.inputs, 0, indices)
+
+			# forward pass this through the decorrelation matrix
+			# all data in each convolution patch is represented in a single vector
+			# (B, n_patches, conv_1d_size*D)
+			x_unfolded = F.unfold(
+				subset.unsqueeze(1), 
+				(d_inner, self.kernel_size[0]), 
+				stride=1, padding=(0, self.kernel_size[0]-1))
+			
+			# reshapes all inputs as corresponding convolutional "patches"
+			patch_matrices = x_unfolded.reshape(
+				indices.shape[0], d_inner, -1, self.kernel_size[0])
+			
+			# perform decorrelation operation
+			decorr_out = einsum(self.decorr_layer, patch_matrices,
+				'd conv_1d_size dummy, n_samples d n_patches dummy -> n_samples n_patches d conv_1d_size')
+
+			grad, corr_loss, whit_loss = loss_module(
+				decorr_out, kappa, compute_grad, compute_loss, batched=True)
+
+			self.grad = grad
+			self.corr_loss = corr_loss
+			self.whit_loss = whit_loss	
 
 class DecorrMamba(MambaLMHeadModel):
 
 	def __init__(self, existing_model: MambaLMHeadModel = None, copy: bool = False, 
 			  kappa: float = 0.5, sample_frac: float = 0.1, decorr_lr = None,
-			  **factory_kwargs):
+			  compute_loss: bool = True, **factory_kwargs):
 
 		if existing_model is not None and copy:
 			self.__dict__.update(deepcopy(existing_model).__dict__)
@@ -285,12 +393,15 @@ class DecorrMamba(MambaLMHeadModel):
 			for name, child in module.named_children():
 				if name == "in_proj" or name == "out_proj" or name == "x_proj":
 					self.n_decorr_layers += 1
-					setattr(module, name, DecorrLinear(original_layer=child))
+					setattr(module, name, DecorrLinear(
+						original_layer=child, reshape_type=name,
+						compute_loss=compute_loss))
 					self.decorr_layers.append(getattr(module, name))
 
 				if name == "conv1d":
 					self.n_decorr_layers += 1 				
-					setattr(module, name, DecorrConv1d(original_layer=child))
+					setattr(module, name, DecorrConv1d(original_layer=child,
+										compute_loss=compute_loss))
 					self.decorr_layers.append(getattr(module, name))
 
 		self.apply(_create_decorr_matrices)
@@ -443,32 +554,12 @@ class DecorrMamba(MambaLMHeadModel):
 			return out.unsqueeze(1), conv_state, ssm_state
 		
 		def _modify_mamba_functions(module):
-			for name, child in module.named_children():
+			for _, child in module.named_children():
 				if type(child) is Mamba:
 					child.forward = _mamba_block_forward.__get__(child)
 					child.step = _mamba_block_step.__get__(child)	
 
 		self.apply(_modify_mamba_functions)
-
-	def reshape_decorr_inputs(self, b):
-		''' 
-		Tracking of inputs to decorrelation layers is complicated by the
-		hardware-aware forward pass. The default implementation of tracking
-		returns input tensors of shapes which aren't always correct for 
-		decorrelation update computation. This fixes it.
-		'''
-		def _fix(module):
-			for name, child in module.named_children():
-				if isinstance(child, DecorrLinear):
-					if name == "in_proj" and len(child.inputs) > 0:
-						child.inputs[0] = child.inputs[0].reshape(
-							(self.config.d_model, b, -1)).permute(1, 2, 0)
-						
-					elif name == "x_proj" and len(child.inputs) > 0:
-						child.inputs[0] = child.inputs[0].reshape(
-							(b, -1, self.backbone.layers[0].mixer.d_inner))	
-
-		self.apply(_fix)
 	
 	def reset_decorr(self, re_fuse: bool = True):
 		''' 
@@ -478,87 +569,9 @@ class DecorrMamba(MambaLMHeadModel):
 		pass
 		'''
 
-		self.apply_to_decorr(lambda x: x.reset())
-		if re_fuse:
-			self.apply_to_decorr(lambda x: x.fuse_decorr())
-
+		self.apply_to_decorr(lambda x: x.reset(re_fuse=re_fuse))
 		self.mean_corr_loss = 0
 		self.mean_whit_loss = 0
-
-	def compute_decorr_grad_loss(self, b, compute_grad: bool=True, 
-							  compute_loss: bool = True):
-		'''
-		Computes gradient updates and/or losses for decorrelation layers across 
-		the entire architecture, based on the layers' recorded inputs. 
-		'''
-		# sampling is expensive time-wise, so we'll use the same batch
-		# samples for all layers. 
-		# pre_sampling_time = time.time()
-		num_samples = int(self.sample_frac * b)
-		indices = torch.randint(0, b, (num_samples,)).to(
-			next(self.parameters()).device)
-		# post_sampling_time = time.time() - pre_sampling_time
-
-		def _compute_decorr_grad_loss(module, indices):
-			with torch.no_grad():
-				assert len(module.inputs) == 1, \
-				f"No/too many inputs found for layer {module}"
-				# pre_index = time.time()
-				subset = torch.index_select(module.inputs[0], 0, indices)
-				# post_index = time.time() - pre_index
-				# pre_forward_time = time.time()
-				# forward pass this through the decorrelation matrix
-				if isinstance(module, DecorrLinear):
-					# print("Linear layer")
-					batched=False
-					decorr_out = F.linear(subset, module.decorr_layer)
-
-				# Conv1d layers use channel_independent decorrelation, forward
-				# passing through the decorrelation matrices is more involved
-				else:
-					# all data in each convolution patch is represented in a single vector
-					# (B, n_patches, conv_1d_size*D)
-					# print("Conv1d layer")
-					batched=True
-					x_unfolded = F.unfold(
-						subset.unsqueeze(1), 
-						(self.backbone.layers[0].mixer.d_inner, module.kernel_size[0]), 
-						stride=1, padding=(0, module.kernel_size[0]-1))
-					
-					# reshapes all inputs as corresponding convolutional "patches"
-					patch_matrices = x_unfolded.reshape(
-						num_samples, self.backbone.layers[0].mixer.d_inner, -1, module.kernel_size[0])
-					
-					# perform decorrelation operation
-					decorr_out = einsum(module.decorr_layer, patch_matrices,
-						'd conv_1d_size dummy, n_samples d n_patches dummy -> n_samples n_patches d conv_1d_size')
-
-				# post_forward_time = time.time() - pre_forward_time
-
-				# pre_loss_time = time.time()
-				grad, corr_loss, whit_loss = self.loss_module(
-					decorr_out, self.kappa,
-					compute_grad, compute_loss, batched=batched)
-				# post_loss_time = time.time() - pre_loss_time
-				
-				# pre_set_time = time.time()
-				module.grad = grad
-				module.corr_loss = corr_loss
-				module.whit_loss = whit_loss	
-				# post_set_time = time.time()	- pre_set_time
-
-
-		# 		print(f"Indexing: {post_index}")
-		# 		print(f"Forward: {post_forward_time}")
-		# 		print(f"Loss/grad computation: {post_loss_time}")
-		# 		print(f"Matrix changing time: {post_set_time}")			
-		# print(f"Sampling: {post_sampling_time}")
-
-		# total_time = time.time()
-		self.apply_to_decorr(partial(_compute_decorr_grad_loss, indices=indices))
-		# post_total_time = time.time() - total_time
-		# print(f"Everything in apply: {post_total_time}")
-
 
 	def mean_decorr_losses(self):
 		''' 
@@ -591,19 +604,13 @@ class DecorrMamba(MambaLMHeadModel):
 		within the Mamba model
 		'''
 		assert self.decorr_lr is not None, "No decorr_lr specified"
-
-		# gradients should already have been computed
-		def _update_decorr_matrices(module):
-			assert module.grad is not None, "Gradient not computed"
-			with torch.no_grad():
-				# PLACE TO IMPLEMENT GAIN SCALING?
-				module.decorr_layer -= self.decorr_lr * (module.grad @ module.decorr_layer)
-
-		self.apply_to_decorr(_update_decorr_matrices)
+		self.apply_to_decorr(lambda x: x.update_decorr_matrices(self.decorr_lr))
 
 	def apply_to_decorr(self, f):
 		"Used for applying simple functions to all of a model's decorrelated layers"
 		for layer in self.decorr_layers:
 			f(layer)
-
 	
+	def compute_losses(self, compute_loss):
+		self.apply_to_decorr(
+			lambda x: setattr(x, 'compute_loss', compute_loss))
