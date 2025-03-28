@@ -154,19 +154,15 @@ class MambaTrainer:
 			# not, because we need to re-fuse the decorrelation and regular
 			# weight matrices regardless, and compute losses properly
 			if isinstance(self.model, DecorrMamba):
-				# pre_reset_time = time.time()
 				self.model.reset_decorr(re_fuse=True)
-				# post_reset_time = time.time() - pre_reset_time
-			
+
 			with torch.amp.autocast(self.device.type, enabled=use_amp):
 				# shift input sequence by one token and compare
 				with torch.enable_grad() if train_backprop else torch.no_grad():
 					pred = self.model(in_seq[:,:-1]).logits
-				
+
 				target = in_seq[:,1:]
 				loss = criterion(pred.permute(0, 2, 1), target)	
-
-			# self.model.apply_to_decorr(lambda x: print(f"{type(x)}\n{len(x.inputs)}"))
 
 			epoch_train_ce_loss += loss.item()
 			ppl = torch.exp(loss).item()
@@ -226,41 +222,29 @@ class MambaTrainer:
 			# update the decorrelation matrices AFTER standard backprop, 
 			# else training breaks!
 			if isinstance(self.model, DecorrMamba):
-				# calculating gradients and losses of decorrelation layers,
-				# then averaging them across the architecture
-			
-				# pre_reshape_time = time.time()
-				self.model.reshape_decorr_inputs(b=b)
-				# post_reshape_time = time.time() - pre_reshape_time
+				# gradient/loss computation happens in the relevant 
+				# modules during the forward pass
 
-				pre_grad_time = time.time()
-				self.model.compute_decorr_grad_loss(compute_grad=train_decorr, b=b)	
-				post_grad_time = time.time() - pre_grad_time
-
-				# pre_mean_time = time.time()	
-				self.model.mean_decorr_losses()	
-				# post_mean_time = time.time() - pre_mean_time	
+				# torch.cuda.synchronize()  # ensure all async operations finish
+				if self.model.compute_loss:
+					self.model.mean_decorr_losses()	
 				
-				pre_log_time = time.time()
-				train_corr_loss = self.model.mean_corr_loss
-				train_whit_loss = self.model.mean_whit_loss
+				# train_corr_loss = self.model.mean_corr_loss
+				# train_whit_loss = self.model.mean_whit_loss
 
-				if train_corr_loss is not None:
-					train_corr_loss = train_corr_loss.item()
-					epoch_train_corr_loss += train_corr_loss
-				if train_whit_loss is not None:
-					train_whit_loss = train_whit_loss.item()
-					epoch_train_whit_loss += train_whit_loss
-				if step%log_freq == 0:
-					wandb.log({"train_corr_loss": train_corr_loss, 
-							"train_whit_loss": train_whit_loss}, step=step)	
+				# if train_corr_loss is not None:
+				# 	train_corr_loss = train_corr_loss.item()
+				# 	epoch_train_corr_loss += train_corr_loss
+				# if train_whit_loss is not None:
+				# 	train_whit_loss = train_whit_loss.item()
+				# 	epoch_train_whit_loss += train_whit_loss
+				# if step%log_freq == 0:
+				# 	wandb.log({"train_corr_loss": train_corr_loss, 
+				# 			"train_whit_loss": train_whit_loss}, step=step)	
 					
-				post_log_time = time.time() - pre_log_time
-				print(f"Grad time: {post_grad_time}")
-				print(f"Logging time: {post_log_time}")
 
-				if train_decorr:
-					self.model.update_decorr_matrices()
+				# if train_decorr:
+				# 	self.model.update_decorr_matrices()
 
 			# Condition checking if validate_every number of gradient descent
 			# steps have happened
