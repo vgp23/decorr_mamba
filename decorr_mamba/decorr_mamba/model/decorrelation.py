@@ -20,7 +20,7 @@ except ImportError:
 
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
 
-loss_stream = torch.cuda.Stream()
+# loss_stream = torch.cuda.Stream()
 
 class DecorrLoss(nn.Module):
 	"""
@@ -47,6 +47,7 @@ class DecorrLoss(nn.Module):
 
 			# used for all modes where the decorrelation layer has only a single
 			# matrix to train
+			device = x.device
 			if not batched:
 				# collapse input across the batch and length dimensions
 				_, _, d = x.shape
@@ -62,6 +63,7 @@ class DecorrLoss(nn.Module):
 				# (D, all_samples, decorr_matrix_size)
 				x = x.permute(2, 0, 1, 3).reshape(d, -1, decorr_matrix_size)
 				mean_dim=1
+		
 
 			# compute the individual loss elements
 			D = x * x
@@ -112,9 +114,7 @@ class DecorrTensor(torch.Tensor):
 	def __matmul__(self, other):
 		"""Intercepts matrix multiplication to log the input."""
 
-		with torch.cuda.stream(loss_stream):
-			self.parent_layer.decorr_operations(other.detach())
-
+		self.parent_layer.inputs = other.detach()
 		result = super().__matmul__(other)
 		return result.as_subclass(torch.Tensor)
 	
@@ -122,9 +122,9 @@ class DecorrTensor(torch.Tensor):
 	def __rmatmul__(self, other):
 		"""Tracks all tensors that multiplied self: x @ W"""
 
-		with torch.cuda.stream(loss_stream):
-			self.parent_layer.decorr_operations(other.detach())
-
+		# with torch.cuda.stream(loss_stream):
+		# 	self.parent_layer.decorr_operations(other.detach())
+		self.parent_layer.inputs = other.detach()
 		result = super().__rmatmul__(other)	
 		return result.as_subclass(torch.Tensor)
 
@@ -153,35 +153,34 @@ class DecorrMixin:
 		self.sample_frac = sample_frac
 		self.compute_loss = compute_loss
 		self.loss_module = DecorrLoss()
+		self.inputs = None
 	
 	def decorr_hook(self, module, input, output):
 		# performs all of the additional decorrelation 
 		# loss/gradient computation operations with the inputs
 		# captured at the beginning of a module's forward pass
-		with torch.cuda.stream(loss_stream):
-			self.decorr_operations(input[0].detach())
+		# with torch.cuda.stream(loss_stream):
+		# 	self.decorr_operations(input[0].detach())
+		self.inputs = input[0].detach()
 
-	def reset(self, re_fuse=True):
+	def reset(self):
 		self.corr_loss = None
 		self.whit_loss = None
 		self.decorr_grad = None
 
-		if re_fuse:
-			self.fuse_decorr()
 
 	def decorr_operations(self, x):
-
-		if self.training or self.compute_loss:
-			# Reshaping
-			if isinstance(self, DecorrLinear):
-				x = self.reshape_decorr_inputs(x)
-			# Gradient/loss computation
-			self.compute_decorr_grad_loss(x)
+		# Reshaping
+		if isinstance(self, DecorrLinear):
+			x = self.reshape_decorr_inputs(x)
+		# Gradient/loss computation
+		self.compute_decorr_grad_loss(x)
 
 	def update_decorr_matrices(self, decorr_lr):
 		assert self.grad is not None, "Gradient not computed"
 		with torch.no_grad():
 			self.decorr_layer -= decorr_lr * (self.grad @ self.decorr_layer)
+			self.fuse_decorr()
 		
 	
 class DecorrLinear(DecorrMixin, nn.Linear):
@@ -423,8 +422,8 @@ class DecorrMamba(MambaLMHeadModel):
 
 		self.apply(_create_decorr_matrices)
 
-		self.mean_corr_loss = 0
-		self.mean_whit_loss = 0
+		self.mean_corr_loss = None
+		self.mean_whit_loss = None
 		self.decorr_lr = decorr_lr
 
 		# These are here for reference only, these have been passed to 
@@ -581,17 +580,16 @@ class DecorrMamba(MambaLMHeadModel):
 
 		self.apply(_modify_mamba_functions)
 	
-	def reset_decorr(self, re_fuse: bool = True):
+	def reset_decorr(self):
 		''' 
 		Resets gradients and losses of decorrelation layers after parameter
 		updates. Also resets the mean losses computed across all decorrelation
-		layers, and re-fuses the weight + decorrelation matrices for the forward
-		pass
+		layers
 		'''
 
-		self.apply_to_decorr(lambda x: x.reset(re_fuse=re_fuse))
-		self.mean_corr_loss = 0
-		self.mean_whit_loss = 0
+		self.apply_to_decorr(lambda x: x.reset())
+		self.mean_corr_loss = None
+		self.mean_whit_loss = None
 
 	def mean_decorr_losses(self):
 		''' 
@@ -609,7 +607,9 @@ class DecorrMamba(MambaLMHeadModel):
 				self.mean_whit_loss += module.whit_loss
 			else:
 				self.mean_whit_loss = None
-
+		
+		self.mean_corr_loss = 0.0
+		self.mean_whit_loss = 0.0
 		self.apply_to_decorr(_sum_losses)
 		
 		if self.mean_corr_loss is not None:
@@ -617,6 +617,9 @@ class DecorrMamba(MambaLMHeadModel):
 		
 		if self.mean_whit_loss is not None:
 			self.mean_whit_loss /= self.n_decorr_layers
+	
+	def decorr_operations(self):
+		self.apply_to_decorr(lambda x: x.decorr_operations(x.inputs))
 
 	def update_decorr_matrices(self):
 		''' 
