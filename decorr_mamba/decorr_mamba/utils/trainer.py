@@ -7,10 +7,11 @@ import os
 import json
 import wandb
 
-from ..utils.helpers import MambaArgs, TrainingArgs
+from ..utils.helpers import TrainingArgs
 from ..model.decorrelation import DecorrMamba, DecorrLinear, DecorrConv1d
 from ..data.synthetics import InductionData
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from mamba_ssm.models.config_mamba import MambaConfig
 
 import time
 
@@ -20,23 +21,24 @@ class MambaTrainer:
 	''' Trains a Mamba architecture according to a pre-specified configuration
 
 		Args:
-			mamba_args (MambaArgs): model specification
+			mamba_args (MambaConfig): model specification
 			train_args (TrainingArgs): training protocol specification
-			model (Mamba): implementation of Mamba architecture as per mamba_args
-			device (str): device on which to train
+			model (MambaLMHeadModel): implementation of Mamba architecture as 
+			per mamba_args
 
 		Attributes:
-			mamba_args (MambaArgs)
+			mamba_args (MambaConfig)
 			train_args (TrainingArgs)
-			model (Mamba)
+			model (MambaLMHeadModel)
+			device (str)
 
 		Methods:
-			train(self, train_loader, val_loader, backprop): trains the architecture
+			train_sequence_steps(): trains the architecture
 				following the protocol in train_args, using provided 
 				training and validation datasets
 	'''
 	def __init__(self, 
-			mamba_args: MambaArgs, train_args: TrainingArgs, 
+			mamba_args: MambaConfig, train_args: TrainingArgs, 
 			model: MambaLMHeadModel):
 
 		self.mamba_args = mamba_args
@@ -113,8 +115,6 @@ class MambaTrainer:
 		if self.train_args.use_lr_sched:
 			scheduler = torch.optim.lr_scheduler.LambdaLR(
 				optimizer, lr_lambda=self.train_args.schedule_fn)
-
-		min_loss = float("inf")
 		
 		save_path = os.path.join(".", "checkpoints")
 		os.makedirs(save_path, exist_ok=True)
@@ -134,6 +134,8 @@ class MambaTrainer:
 			self.model.train()
 		else:
 			self.model.eval()
+
+		print(self.model)
 
 		for step in tqdm(range(1, self.train_args.n_steps+1)):
 			# an infinite loop for the fixed number of gradient descent 
@@ -222,7 +224,7 @@ class MambaTrainer:
 			if isinstance(self.model, DecorrMamba):
 				# torch.cuda.synchronize()  # ensure all async operations finish
 				if self.model.compute_loss or self.model.training:
-					self.model.decorr_operations()
+					self.model.decorr_operations(b=b)
 					self.model.mean_decorr_losses()	
 				
 				train_corr_loss = self.model.mean_corr_loss
@@ -268,6 +270,10 @@ class MambaTrainer:
 
 				# -------------------------------- validation -------------------------------------	
 
+				# Don't want to compute whitening/correlation losses here because
+				# it makes validation extremely slow, if cross entropy is lower 
+				# that's all that really matters for the most part
+				
 				self.model.eval()
 
 				total_val_ce_loss = 0.0

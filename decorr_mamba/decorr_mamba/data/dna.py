@@ -19,9 +19,25 @@ class DNADataset(Dataset):
         return self.data[idx]
 
     @staticmethod
-    def make_sequences(fasta_file, bed_file, split, L=2**17, 
-            include_lowercase=False):
-        
+    def make_sequences(fasta_file: str, bed_file: str, split: str, L: int=2**17, 
+            include_lowercase: bool=False):
+        """Generates and saves DNA sequences as tensors from a FASTA file and BED file.
+
+        All tensors saved in torch.uint8 because more is unnecessary (only 5 or 9
+        different tokens are possible, depending on include_lowercase). All batches
+        are cast back into torch.float32 during training. 
+
+        Args:
+            fasta_file (str): Path to the gzipped FASTA file containing genomic sequences.
+            bed_file (str): Path to the BED file defining genomic regions of interest.
+            split (str): Dataset split to process ('train', 'valid', or 'test').
+            L (int, optional): Length of sequence segments. Default is 2^17.
+            include_lowercase (bool, optional): Whether to distinguish between lowercase and uppercase bases. 
+                Default is False.
+
+        Raises:
+            AssertionError: If `split` is not one of 'train', 'valid', or 'test'.
+        """
         # import genome
         with gzip.open(fasta_file, 'rt') as handle:
             genome = SeqIO.to_dict(SeqIO.parse(handle, "fasta"))

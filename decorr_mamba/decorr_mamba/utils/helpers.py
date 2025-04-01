@@ -93,6 +93,11 @@ class MambaArgs:
 	Contains all the arguments necessary to define a Mamba model. Default values
 	for all of these are found in the .json files in the template_experiment folder, 
 	and are coped from the original Mamba inplementation. 
+
+
+	OUTDATED: ALL DEFAULT MAMBA ARCHITECTURES ARE TRAINED USING THE DEFAULT
+	MambaConfig CLASS FROM THE MAMBA REPO, THIS WAS FOR PERSONAL USE ONLY
+
 	'''
 
 	N: int # hidden dimensionality
@@ -301,13 +306,6 @@ class LanguageDatasetMaker:
 
 		return train_set, val_set, test_set
 	
-
-if __name__ == "__main__":
-	test = TrainingArgs(n_steps=10000, lr=8e-3, use_lr_sched=True, 
-					 min_lr = 1e-5, warmup_steps=1000, 
-					 L=None, B=None, adam_beta=None, adam_epsilon=None, gradient_clip=None, weight_decay=None)
-
-	test.show_lr_schedule()
 
 
 

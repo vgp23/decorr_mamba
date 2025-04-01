@@ -83,16 +83,4 @@ if __name__ == "__main__":
     # create dataset
     create_validation_set(vocab_size, L, prefix_len, n_seq, file_path)
 
-    # with open(file_path, 'rb') as file:
-    #     # Deserialize the array
-    #     loaded_arr = pkl.load(file)
-
-    # print(loaded_arr.shape)
-    
-
-
-
-
-    # print(np.sum(loaded_arr[0] == 15))
-
 
