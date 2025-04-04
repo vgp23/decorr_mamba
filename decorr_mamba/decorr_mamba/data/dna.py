@@ -17,6 +17,81 @@ class DNADataset(Dataset):
 
     def __getitem__(self, idx):
         return self.data[idx]
+    
+    @staticmethod
+    def get_prior(fasta_file, include_lowercase=False):
+        ''' Gets prior probabilities across all of the tokens, to establish
+            experimental baselines. '''
+        with gzip.open(fasta_file, 'rt') as handle:
+            genome = SeqIO.to_dict(SeqIO.parse(handle, "fasta"))   
+
+        keys = [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY"]
+
+        if include_lowercase:
+            n_a=n_A=n_t=n_T=n_g=n_G=n_c=n_C=n_n=n_N=tot_len = 0
+            for key in tqdm(keys):
+                seq = str(genome[key].seq)
+                n_a += seq.count("a")
+                n_t += seq.count("t")
+                n_g += seq.count("g")
+                n_c += seq.count("c")
+                n_n += seq.count("n")
+                n_A += seq.count("A")
+                n_T += seq.count("T")
+                n_G += seq.count("G")
+                n_C += seq.count("C")
+                n_N += seq.count("N")
+                tot_len += len(seq)
+
+            p_a = (n_a/tot_len)
+            p_t = (n_t/tot_len)
+            p_g = (n_g/tot_len)
+            p_c = (n_c/tot_len)
+            p_n = (n_n/tot_len)
+            p_A = (n_A/tot_len)
+            p_T = (n_T/tot_len)
+            p_G = (n_G/tot_len)
+            p_C = (n_C/tot_len)
+            p_N = (n_N/tot_len)
+
+            prior = {"a": p_a,
+                     "t": p_t,
+                     "g": p_g,
+                     "c": p_c,
+                     "n": p_n,
+                     "A": p_A,
+                     "T": p_T,
+                     "G": p_G,
+                     "C": p_C,
+                     "N": p_N}
+
+            return prior
+
+        else:
+
+            n_a = n_t = n_g = n_c = n_n = tot_len = 0
+            for key in tqdm(keys):
+                seq = str(genome[key].seq).lower()
+                n_a += seq.count("a")
+                n_t += seq.count("t")
+                n_g += seq.count("g")
+                n_c += seq.count("c")
+                n_n += seq.count("n")
+                tot_len += len(seq)
+
+            p_a = (n_a/tot_len)
+            p_t = (n_t/tot_len)
+            p_g = (n_g/tot_len)
+            p_c = (n_c/tot_len)
+            p_n = (n_n/tot_len)
+
+            prior = {"a": p_a,
+                     "t": p_t,
+                     "g": p_g,
+                     "c": p_c,
+                     "n": p_n}
+            
+            return prior
 
     @staticmethod
     def make_sequences(fasta_file: str, bed_file: str, split: str, L: int=2**17, 

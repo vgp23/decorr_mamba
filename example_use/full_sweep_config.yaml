@@ -1,0 +1,46 @@
+project: decorr_mamba  #  Name of the W&B project
+entity: flatachu  # W&B entity/workspace
+
+program: sweep.py  # The script to run for each sweep
+method: grid # Sweep method: 'grid', 'random', or 'bayes'
+
+metric:
+  name: val_ce_loss  # Metric to optimize
+  goal: minimize  # 'minimize' or 'maximize'
+
+parameters:
+  backprop_lr:
+    values: [0.00025, 0.0005, 0.001, 0.002, 0.004, 0.008, 0.016]
+  decorr_lr:
+    values: [0.0, 0.000001, 0.00001, 0.0001, 0.001, 0.01]
+
+command:
+  - ${env}  # Automatically includes the environment W&B sets up
+  - python
+  - sweep.py
+  - --backprop_lr
+  - 0.0
+  - --decorr_lr
+  - 0.0
+  - --d
+  - 64
+  - --n
+  - 16
+  - --use_decorr
+  - --n_layers
+  - 8
+  - --vocab_size
+  - 9
+  - --n_steps
+  - 1000
+  - --l
+  - 1024
+  - --b
+  - 128
+  - --dataset
+  - hg38_length_1024_include_lowercase_True
+  - --use_lr_sched
+  - False
+  - --log_freq
+  - 25
+

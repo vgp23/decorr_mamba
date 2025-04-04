@@ -431,6 +431,8 @@ class DecorrConv1d(DecorrMixin, nn.Conv1d):
 	def forward(self, x):
 		# forward hook takes care of input tracking, don't want a TrackedTensor
 		# here. 	
+
+		
 		return conv1d(x, self.fused_weight.as_subclass(torch.Tensor), self.bias, 
 				self.stride, self.padding, self.dilation, self.groups)
 
@@ -508,7 +510,7 @@ class DecorrMamba(MambaLMHeadModel):
 			**factory_kwargs: Additional arguments for model initialization.
 		"""
 
-		if existing_model is not None and copy:
+		if existing_model and copy:
 			self.__dict__.update(deepcopy(existing_model).__dict__)
 			if factory_kwargs.get("config") is not None:
 				print(
@@ -621,6 +623,7 @@ class DecorrMamba(MambaLMHeadModel):
 					conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
 				if causal_conv1d_fn is None:
 					x = self.act(self.conv1d(x)[..., :seqlen])
+					print(x.transpose(1,2))
 				else:
 					assert self.activation in ["silu", "swish"]
 					x = causal_conv1d_fn(
