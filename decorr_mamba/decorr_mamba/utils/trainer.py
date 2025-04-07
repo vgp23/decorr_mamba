@@ -75,7 +75,7 @@ class MambaTrainer:
 
 	def train_sequence_steps(self, train_loader: DataLoader, val_loader: DataLoader, 
 		use_amp: bool, log_freq: int, n_val: int, train_backprop: bool=True, 
-		train_decorr: bool=True, save_checkpoints: bool=True):
+		train_decorr: bool=True, save_checkpoints: bool=True, pad_idx: int = None):
 
 		''' 
 		Trains the model with the protocol specified in train_args. Trains based
@@ -84,7 +84,12 @@ class MambaTrainer:
 
 		'''
 
-		criterion = nn.CrossEntropyLoss()
+		# Index used for sequence length padding in proteome modelling task
+		if pad_idx:
+			criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
+		else:
+			criterion = nn.CrossEntropyLoss()
+
 		if not train_backprop:
 			print("Warning: not training backpropagation parameters!")
 		if not train_decorr:
@@ -146,7 +151,7 @@ class MambaTrainer:
 				train_iterator = iter(train_loader)  # Reset the iterator
 				next_batch = next(train_iterator)
 
-			in_seq = next_batch.to(self.device, non_blocking=True).long()
+			in_seq = next_batch.long().to(self.device, non_blocking=True)
 			b = in_seq.shape[0] # Needed for decorr input reshaping 
 
 			if train_backprop:
@@ -162,7 +167,9 @@ class MambaTrainer:
 					pred = self.model(in_seq[:,:-1]).logits
 
 				target = in_seq[:,1:]
-				loss = criterion(pred.permute(0, 2, 1), target)	
+				# NB: ignore the irrelevant extra dimensions in the output,
+				# those are just there for padding (GPU efficiency)
+				loss = criterion(pred.permute(0, 2, 1)[:, :self.train_args.vocab_size], target)	
 
 			epoch_train_ce_loss += loss.item()
 			ppl = torch.exp(loss).item()
@@ -290,7 +297,7 @@ class MambaTrainer:
 							# 	# and the model
 							# 	self.model.reset_decorr()
 
-							in_seq = next_batch.to(self.device, non_blocking=True).long()
+							in_seq = next_batch.long().to(self.device, non_blocking=True)
 							pred = self.model(in_seq[:,:-1]).logits
 							target = in_seq[:,1:]
 							loss = criterion(pred.permute(0,2,1), target)
