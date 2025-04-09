@@ -112,20 +112,31 @@ class MambaTrainer:
 					lr=self.train_args.lr,
 					betas=self.train_args.adam_beta,
 					eps=self.train_args.adam_epsilon)
+				
 			elif self.train_args.optimizer == "soap":
 
 				print("\nUsing SOAP optimizer!")
+
+				# stick to default values for now
+
+				# optimizer = SOAP(
+				# 	[{'params': self._param_groups['decay'],
+				# 	'weight_decay': self.train_args.weight_decay}, 
+
+				# 	{'params': self._param_groups['no_decay'], 
+				# 	'weight_decay': 0.0}], 
+
+				# 	lr=self.train_args.lr,
+				# 	betas=self.train_args.adam_beta,
+				# 	eps=self.train_args.adam_epsilon)	
 
 				optimizer = SOAP(
 					[{'params': self._param_groups['decay'],
 					'weight_decay': self.train_args.weight_decay}, 
 
 					{'params': self._param_groups['no_decay'], 
-					'weight_decay': 0.0}], 
-
-					lr=self.train_args.lr,
-					betas=self.train_args.adam_beta,
-					eps=self.train_args.adam_epsilon)	
+					'weight_decay': 0.0}],
+					lr=self.train_args.lr)
 			else:
 				raise NotImplementedError			
 			
@@ -138,12 +149,17 @@ class MambaTrainer:
 			elif self.train_args.optimizer == "soap":
 
 				print("\nUsing SOAP optimizer!")
-				
-				optimizer = SOAP(self.model.parameters(), 
-					 weight_decay=0.0,
-					lr=self.train_args.lr,
-					betas=self.train_args.adam_beta,
-					eps=self.train_args.adam_epsilon)	
+
+				# stick to default values for now
+
+				# optimizer = SOAP(self.model.parameters(), 
+				# 	 weight_decay=0.0,
+				# 	lr=self.train_args.lr,
+				# 	betas=self.train_args.adam_beta,
+				# 	eps=self.train_args.adam_epsilon)	
+
+				optimizer = SOAP(self.model.parameters(), weight_decay=0.0, 
+					 lr=self.train_args.lr)
 			else:
 				raise NotImplementedError				   
 
