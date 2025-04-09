@@ -140,8 +140,6 @@ class MambaTrainer:
 		else:
 			self.model.eval()
 
-		print(self.model)
-
 		for step in tqdm(range(1, self.train_args.n_steps+1)):
 			# an infinite loop for the fixed number of gradient descent 
 			# steps
@@ -169,7 +167,7 @@ class MambaTrainer:
 				target = in_seq[:,1:]
 				# NB: ignore the irrelevant extra dimensions in the output,
 				# those are just there for padding (GPU efficiency)
-				loss = criterion(pred.permute(0, 2, 1)[:, :self.train_args.vocab_size], target)	
+				loss = criterion(pred.permute(0, 2, 1)[:, :self.mamba_args.vocab_size], target)	
 
 			epoch_train_ce_loss += loss.item()
 			ppl = torch.exp(loss).item()
