@@ -8,12 +8,13 @@ import json
 import wandb
 
 from ..utils.helpers import TrainingArgs
-from ..model.decorrelation import DecorrMamba, DecorrLinear, DecorrConv1d
+from ..model.decorrelation import DecorrMamba
 from ..data.synthetics import InductionData
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.models.config_mamba import MambaConfig
+from ..utils.SOAP.soap import SOAP
 
-import time
+
 
 # os.environ["WANDB_SILENT"] = "true"
 
@@ -100,22 +101,51 @@ class MambaTrainer:
 			print("Warning: train_decorr set to True but model does not use decorrelation!")
 
 		if self.train_args.weight_decay is not None:
-			optimizer = torch.optim.AdamW(
-				[{'params': self._param_groups['decay'],
-				  'weight_decay': self.train_args.weight_decay}, 
+			if self.train_args.optimizer == "adam":
+				optimizer = torch.optim.AdamW(
+					[{'params': self._param_groups['decay'],
+					'weight_decay': self.train_args.weight_decay}, 
 
-				 {'params': self._param_groups['no_decay'], 
-				  'weight_decay': 0.0}], 
+					{'params': self._param_groups['no_decay'], 
+					'weight_decay': 0.0}], 
 
-				  lr=self.train_args.lr,
-				  betas=self.train_args.adam_beta,
-				  eps=self.train_args.adam_epsilon)
+					lr=self.train_args.lr,
+					betas=self.train_args.adam_beta,
+					eps=self.train_args.adam_epsilon)
+			elif self.train_args.optimizer == "soap":
+
+				print("\nUsing SOAP optimizer!")
+
+				optimizer = SOAP(
+					[{'params': self._param_groups['decay'],
+					'weight_decay': self.train_args.weight_decay}, 
+
+					{'params': self._param_groups['no_decay'], 
+					'weight_decay': 0.0}], 
+
+					lr=self.train_args.lr,
+					betas=self.train_args.adam_beta,
+					eps=self.train_args.adam_epsilon)	
+			else:
+				raise NotImplementedError			
 			
 		else:
-			optimizer = torch.optim.Adam(self.model.parameters(), 
-										lr=self.train_args.lr, 
-										betas=self.train_args.adam_beta,
-										eps=self.train_args.adam_epsilon)    
+			if self.train_args.optimizer == "adam":
+				optimizer = torch.optim.Adam(self.model.parameters(), 
+											lr=self.train_args.lr, 
+											betas=self.train_args.adam_beta,
+											eps=self.train_args.adam_epsilon) 
+			elif self.train_args.optimizer == "soap":
+
+				print("\nUsing SOAP optimizer!")
+				
+				optimizer = SOAP(self.model.parameters(), 
+					 weight_decay=0.0,
+					lr=self.train_args.lr,
+					betas=self.train_args.adam_beta,
+					eps=self.train_args.adam_epsilon)	
+			else:
+				raise NotImplementedError				   
 
 		if self.train_args.use_lr_sched:
 			scheduler = torch.optim.lr_scheduler.LambdaLR(

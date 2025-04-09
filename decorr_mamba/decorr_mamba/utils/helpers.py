@@ -35,6 +35,8 @@ class TrainingArgs():
 	# n_steps and warmup_steps can refer to both epochs and gradient descent
 	# steps
 	warmup_steps: int
+
+	optimizer: str = "adam"
 	
 	def __post_init__(self):
 		# NB specification in the paper uses 5x the learning rate of a comparable 

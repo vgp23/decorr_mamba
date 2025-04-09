@@ -1,0 +1,3 @@
+[submodule "decorr_mamba/decorr_mamba/utils/SOAP"]
+	path = decorr_mamba/decorr_mamba/utils/SOAP
+	url = git@github.com:nikhilvyas/SOAP.git
