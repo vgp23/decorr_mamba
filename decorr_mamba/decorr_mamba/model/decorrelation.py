@@ -285,7 +285,9 @@ class DecorrLinear(DecorrMixin, nn.Linear):
 		new_layer.register_forward_hook(new_layer.decorr_hook)
 
 		# Fuse decorrelation + weight matrix
-		new_layer.fuse_decorr()
+		# new_layer.fuse_decorr()
+		new_layer.fused_weight = new_layer.weight @ new_layer.decorr_layer
+	
 
 		return new_layer
 
@@ -424,15 +426,18 @@ class DecorrConv1d(DecorrMixin, nn.Conv1d):
 		new_layer.register_forward_hook(new_layer.decorr_hook)
 
 		# Fuse decorrelation + weight matrix
-		new_layer.fuse_decorr()
+		# new_layer.fuse_decorr()
+		new_layer.fused_weight = torch.unsqueeze(
+					einsum(
+						new_layer.decorr_layer, torch.squeeze(new_layer.weight),
+						'd dummy conv_1d_size, d dummy -> d conv_1d_size'), 
+						1)
 
 		return new_layer
 
 	def forward(self, x):
 		# forward hook takes care of input tracking, don't want a TrackedTensor
 		# here. 	
-
-		
 		return conv1d(x, self.fused_weight.as_subclass(torch.Tensor), self.bias, 
 				self.stride, self.padding, self.dilation, self.groups)
 
@@ -443,10 +448,12 @@ class DecorrConv1d(DecorrMixin, nn.Conv1d):
 		inputs through both matrices separately.
 		
 		Save result as a TrackingTensor, to save inputs during selective scan."""
+
+		# CHECK THIS??? .data is weird
 		self.fused_weight = TrackingTensor(
 			torch.unsqueeze(
 					einsum(
-						self.decorr_layer.data, torch.squeeze(self.weight.data),
+						self.decorr_layer, torch.squeeze(self.weight),
 						'd dummy conv_1d_size, d dummy -> d conv_1d_size'), 
 						1), 
 						parent_layer=self)
@@ -588,6 +595,9 @@ class DecorrMamba(MambaLMHeadModel):
 					return out
 
 			# We do matmul and transpose BLH -> HBL at the same time
+			# print(self.in_proj.fused_weight.device)
+			print(f"Hidden: {hidden_states.device}")
+
 			xz = rearrange(
 				self.in_proj.fused_weight @ rearrange(hidden_states, "b l d -> d (b l)"),
 				"d (b l) -> b d l",
@@ -659,6 +669,8 @@ class DecorrMamba(MambaLMHeadModel):
 					ssm_state.copy_(last_state)
 				y = rearrange(y, "b d l -> b l d")
 				out = self.out_proj(y)
+
+			print("Finished pass!")
 			return out
 
 		def _mamba_block_step(self, hidden_states, conv_state, ssm_state):

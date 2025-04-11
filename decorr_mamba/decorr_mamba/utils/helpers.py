@@ -24,6 +24,7 @@ class TrainingArgs():
 	lr: float
 	adam_beta: tuple 
 	adam_epsilon: float
+	parallel_gpus: bool
 
 	gradient_clip: float
 	weight_decay: float

@@ -45,7 +45,8 @@ class MambaTrainer:
 		self.mamba_args = mamba_args
 		self.train_args = train_args
 		self.model = model
-		self.device = self.model.lm_head.weight.device
+
+		self.device = self._get_model_without_dp().lm_head.weight.device
 
 		def _add_param_to_groups(module, param_groups):
 			'''
@@ -73,7 +74,13 @@ class MambaTrainer:
 			# but the logic above counts this parameter twice. Remove to fix.
 			del self._param_groups["decay"][-1]
 
-
+	def _get_model_without_dp(self):
+		"""Helper to access the underlying model if DataParallel is used."""
+		if isinstance(self.model, nn.DataParallel):
+			return self.model.module  # return the original model
+		else:
+			return self.model  # return the model as-is if not DataParallel
+	
 	def train_sequence_steps(self, train_loader: DataLoader, val_loader: DataLoader, 
 		use_amp: bool, log_freq: int, n_val: int, train_backprop: bool=True, 
 		train_decorr: bool=True, save_checkpoints: bool=True, pad_idx: int = None):
@@ -97,7 +104,7 @@ class MambaTrainer:
 			print("Warning: not training decorrelation parameters!")
 		assert train_backprop or train_decorr, "Specify something to train"
 
-		if not isinstance(self.model, DecorrMamba) and train_decorr:
+		if not isinstance(self._get_model_without_dp(), DecorrMamba) and train_decorr:
 			print("Warning: train_decorr set to True but model does not use decorrelation!")
 
 		if self.train_args.weight_decay is not None:
@@ -201,14 +208,16 @@ class MambaTrainer:
 			if train_backprop:
 				optimizer.zero_grad()
 			
-			if isinstance(self.model, DecorrMamba):
-				if self.model.compute_loss or self.model.training:
-					self.model.reset_decorr()
+			if isinstance(self._get_model_without_dp(), DecorrMamba):
+				if self._get_model_without_dp().compute_loss or self.model.training:
+					
+					self._get_model_without_dp().reset_decorr()
 
 			with torch.amp.autocast(self.device.type, enabled=use_amp):
 				# shift input sequence by one token and compare
 				with torch.enable_grad() if train_backprop else torch.no_grad():
 					pred = self.model(in_seq[:,:-1]).logits
+					print("FINISHED A COMPLETE PASS, ONTO THE NEXT")
 
 				target = in_seq[:,1:].contiguous()
 				# NB: ignore the irrelevant extra dimensions in the output,
@@ -276,14 +285,14 @@ class MambaTrainer:
 			
 			# update the decorrelation matrices AFTER standard backprop, 
 			# else training breaks!
-			if isinstance(self.model, DecorrMamba):
+			if isinstance(self._get_model_without_dp(), DecorrMamba):
 				# torch.cuda.synchronize()  # ensure all async operations finish
-				if self.model.compute_loss or self.model.training:
-					self.model.decorr_operations(b=b)
-					self.model.mean_decorr_losses()	
+				if self._get_model_without_dp().compute_loss or self.model.training:
+					self._get_model_without_dp().decorr_operations(b=b)
+					self._get_model_without_dp().mean_decorr_losses()	
 				
-				train_corr_loss = self.model.mean_corr_loss
-				train_whit_loss = self.model.mean_whit_loss
+				train_corr_loss = self._get_model_without_dp().mean_corr_loss
+				train_whit_loss = self._get_model_without_dp().mean_whit_loss
 
 				if train_corr_loss is not None:
 					train_corr_loss = train_corr_loss.item()
@@ -297,7 +306,7 @@ class MambaTrainer:
 					
 
 				if train_decorr:
-					self.model.update_decorr_matrices()
+					self._get_model_without_dp().update_decorr_matrices()
 
 			# Condition checking if validate_every number of gradient descent
 			# steps have happened
@@ -311,7 +320,7 @@ class MambaTrainer:
 
 				print(f"\"Epoch\" train CE loss: {epoch_train_ce_loss:.4f}")
 				print(f"\"Epoch\" train perplexity: {epoch_train_ppl:.4f}")
-				if isinstance(self.model, DecorrMamba):	
+				if isinstance(self._get_model_without_dp(), DecorrMamba):	
 					if epoch_train_corr_loss > 0:		
 						print(f"\"Epoch\" train correlation loss: {epoch_train_corr_loss:.4f}")
 					if epoch_train_whit_loss > 0:						
