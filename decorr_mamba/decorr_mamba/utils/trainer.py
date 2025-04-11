@@ -210,10 +210,14 @@ class MambaTrainer:
 				with torch.enable_grad() if train_backprop else torch.no_grad():
 					pred = self.model(in_seq[:,:-1]).logits
 
-				target = in_seq[:,1:]
+				target = in_seq[:,1:].contiguous()
 				# NB: ignore the irrelevant extra dimensions in the output,
-				# those are just there for padding (GPU efficiency)
-				loss = criterion(pred.permute(0, 2, 1)[:, :self.mamba_args.vocab_size], target)	
+				# those are just there for padding (GPU efficiency). Collapse
+				# across batch and length before feeding to model.
+				output_dim = pred.shape[-1]
+				loss = criterion(
+					pred.view(-1, output_dim)[:,:self.mamba_args.vocab_size],
+					target.view(-1))	
 
 			epoch_train_ce_loss += loss.item()
 			ppl = torch.exp(loss).item()
@@ -343,8 +347,11 @@ class MambaTrainer:
 
 							in_seq = next_batch.long().to(self.device, non_blocking=True)
 							pred = self.model(in_seq[:,:-1]).logits
-							target = in_seq[:,1:]
-							loss = criterion(pred.permute(0,2,1), target)
+							target = in_seq[:,1:].contiguous()
+
+							output_dim = pred.shape[-1]
+							loss = criterion(pred.view(-1, output_dim)[:,:self.mamba_args.vocab_size],
+											 target.view(-1))
 									
 							total_val_ce_loss += loss.item()
 							ppl = torch.exp(loss).item()
