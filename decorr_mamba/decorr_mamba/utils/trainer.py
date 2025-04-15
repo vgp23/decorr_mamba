@@ -14,6 +14,8 @@ from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.models.config_mamba import MambaConfig
 from ..utils.SOAP.soap import SOAP
 
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 
 
 # os.environ["WANDB_SILENT"] = "true"
@@ -46,7 +48,7 @@ class MambaTrainer:
 		self.train_args = train_args
 		self.model = model
 
-		self.device = self._get_model_without_dp().lm_head.weight.device
+		self.device = self.get_model().lm_head.weight.device
 
 		def _add_param_to_groups(module, param_groups):
 			'''
@@ -74,16 +76,70 @@ class MambaTrainer:
 			# but the logic above counts this parameter twice. Remove to fix.
 			del self._param_groups["decay"][-1]
 
-	def _get_model_without_dp(self):
-		"""Helper to access the underlying model if DataParallel is used."""
-		if isinstance(self.model, nn.DataParallel):
-			return self.model.module  # return the original model
+	def get_model(self):
+		if isinstance(self.model, DDP):
+			return self.model.module
 		else:
-			return self.model  # return the model as-is if not DataParallel
-	
+			return self.model
+		
+	def sync_decorr(self):
+		""" 
+		Averages gradients and losses across all of the distributed 
+		processes, for each decorrelation layer.
+
+		"""
+
+		def _sync_one_param(layer: torch.nn.Parameter):
+			world_size = torch.distributed.get_world_size()
+			# averaging gradients
+			assert layer.decorr_layer.grad is not None, "Gradients not computed!"
+
+			torch.distributed.all_reduce(
+				layer.decorr_layer.grad, op=torch.distributed.ReduceOp.SUM)
+			layer.decorr_layer.grad /= world_size
+
+			# averaging losses
+			if layer.whit_loss is not None:
+				torch.distributed.all_reduce(
+					layer.whit_loss, op=torch.distributed.ReduceOp.SUM)
+				layer.whit_loss /= world_size
+
+			if layer.corr_loss is not None:
+				torch.distributed.all_reduce(
+					layer.corr_loss, op=torch.distributed.ReduceOp.SUM)
+				layer.corr_loss /= world_size
+
+		with torch.no_grad():
+			self.get_model().apply_to_decorr(lambda x: _sync_one_param(x))
+
+	@staticmethod
+	def sync_tensor(tensor):
+		torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+		tensor /= torch.distributed.get_world_size()
+
+		return tensor
+
+	def sync_mean_losses(self):
+		""" 
+		Averages mean losses across all of the distributed models
+		"""
+		world_size = torch.distributed.get_world_size()
+		
+		if self.get_model().mean_corr_loss is not None:
+			torch.distributed.all_reduce(
+				self.get_model().mean_corr_loss, op=torch.distributed.ReduceOp.SUM)
+			self.get_model().mean_corr_loss /= world_size	
+
+		if self.get_model().mean_whit_loss is not None:
+			torch.distributed.all_reduce(
+				self.get_model().mean_whit_loss, op=torch.distributed.ReduceOp.SUM)
+			self.get_model().mean_whit_loss /= world_size	
+
+
 	def train_sequence_steps(self, train_loader: DataLoader, val_loader: DataLoader, 
 		use_amp: bool, log_freq: int, n_val: int, train_backprop: bool=True, 
-		train_decorr: bool=True, save_checkpoints: bool=True, pad_idx: int = None):
+		train_decorr: bool=True, save_checkpoints: bool=True, pad_idx: int = None,
+		rank: int=None):
 
 		''' 
 		Trains the model with the protocol specified in train_args. Trains based
@@ -91,6 +147,9 @@ class MambaTrainer:
 		at pre-defined points within the training loop. 
 
 		'''
+		def maybe_tqdm(iterator, use_tqdm):
+			""" Useful for controlling console printouts during DDP training"""
+			return tqdm(iterator) if use_tqdm else iterator
 
 		# Index used for sequence length padding in proteome modelling task
 		if pad_idx:
@@ -98,14 +157,20 @@ class MambaTrainer:
 		else:
 			criterion = nn.CrossEntropyLoss()
 
-		if not train_backprop:
-			print("Warning: not training backpropagation parameters!")
-		if not train_decorr:
-			print("Warning: not training decorrelation parameters!")
-		assert train_backprop or train_decorr, "Specify something to train"
+		# only want to log things to wandb if we're not training with ddp, or 
+		# if we're in the rank-0 process within ddp. This flag keeps track
+		# of that and is more legible
+		no_ddp_or_main = (self.train_args.ddp and rank == 0) or rank == None
 
-		if not isinstance(self._get_model_without_dp(), DecorrMamba) and train_decorr:
-			print("Warning: train_decorr set to True but model does not use decorrelation!")
+		if no_ddp_or_main:
+			if not train_backprop:
+				print("Warning: not training backpropagation parameters!")
+			if not train_decorr:
+				print("Warning: not training decorrelation parameters!")
+			assert train_backprop or train_decorr, "Specify something to train"
+
+			if not isinstance(self.get_model(), DecorrMamba) and train_decorr:
+				print("Warning: train_decorr set to True but model does not use decorrelation!")
 
 		if self.train_args.weight_decay is not None:
 			if self.train_args.optimizer == "adam":
@@ -121,8 +186,9 @@ class MambaTrainer:
 					eps=self.train_args.adam_epsilon)
 				
 			elif self.train_args.optimizer == "soap":
-
-				print("\nUsing SOAP optimizer!")
+				
+				if no_ddp_or_main:
+					print("\nUsing SOAP optimizer!")
 
 				# stick to default values for now
 
@@ -154,8 +220,9 @@ class MambaTrainer:
 											betas=self.train_args.adam_beta,
 											eps=self.train_args.adam_epsilon) 
 			elif self.train_args.optimizer == "soap":
-
-				print("\nUsing SOAP optimizer!")
+				
+				if no_ddp_or_main:
+					print("\nUsing SOAP optimizer!")
 
 				# stick to default values for now
 
@@ -193,48 +260,61 @@ class MambaTrainer:
 		else:
 			self.model.eval()
 
-		for step in tqdm(range(1, self.train_args.n_steps+1)):
+		epoch = 0 # needed for shuffling of multi-gpu data samplers
+		if hasattr(train_loader.sampler, "set_epoch"):
+			train_loader.sampler.set_epoch(epoch)
+
+		for step in maybe_tqdm(range(1, self.train_args.n_steps+1), 
+						 use_tqdm=no_ddp_or_main):
 			# an infinite loop for the fixed number of gradient descent 
 			# steps
 			try:
 				next_batch = next(train_iterator)
 			except StopIteration:
+				epoch += 1
+				if hasattr(train_loader.sampler, "set_epoch"):
+					train_loader.sampler.set_epoch(epoch)
 				train_iterator = iter(train_loader)  # Reset the iterator
 				next_batch = next(train_iterator)
 
 			in_seq = next_batch.long().to(self.device, non_blocking=True)
-			b = in_seq.shape[0] # Needed for decorr input reshaping 
 
 			if train_backprop:
 				optimizer.zero_grad()
 			
-			if isinstance(self._get_model_without_dp(), DecorrMamba):
-				if self._get_model_without_dp().compute_loss or self.model.training:
-					
-					self._get_model_without_dp().reset_decorr()
+			if isinstance(self.get_model(), DecorrMamba):
+				if self.get_model().compute_loss or self.model.training:
+					self.get_model().reset_decorr()
 
 			with torch.amp.autocast(self.device.type, enabled=use_amp):
 				# shift input sequence by one token and compare
 				with torch.enable_grad() if train_backprop else torch.no_grad():
 					pred = self.model(in_seq[:,:-1]).logits
-					print("FINISHED A COMPLETE PASS, ONTO THE NEXT")
 
 				target = in_seq[:,1:].contiguous()
 				# NB: ignore the irrelevant extra dimensions in the output,
 				# those are just there for padding (GPU efficiency). Collapse
-				# across batch and length before feeding to model.
+				# across batch and length before feeding to loss.
 				output_dim = pred.shape[-1]
 				loss = criterion(
 					pred.view(-1, output_dim)[:,:self.mamba_args.vocab_size],
 					target.view(-1))	
+				
+				# needed for synchronizing during ddp
+				loss_tensor = loss.detach().clone()
+				
+			# average the loss values across models
+			if self.train_args.ddp:
+				loss_tensor = self.sync_tensor(loss_tensor)
 
-			epoch_train_ce_loss += loss.item()
-			ppl = torch.exp(loss).item()
+			epoch_train_ce_loss += loss_tensor.item()
+			ppl = torch.exp(loss_tensor).item()
 			epoch_train_ppl += ppl
 
-			if step%log_freq == 0:
-				wandb.log({"train_ce_loss": loss.item(), 
-			   				"train_ppl": ppl}, step=step)					
+			if no_ddp_or_main:
+				if step%log_freq == 0:
+					wandb.log({"train_ce_loss": loss_tensor.item(), 
+								"train_ppl": ppl}, step=step)					
 
 			if train_backprop:
 				scaler.scale(loss).backward()
@@ -285,14 +365,22 @@ class MambaTrainer:
 			
 			# update the decorrelation matrices AFTER standard backprop, 
 			# else training breaks!
-			if isinstance(self._get_model_without_dp(), DecorrMamba):
-				# torch.cuda.synchronize()  # ensure all async operations finish
-				if self._get_model_without_dp().compute_loss or self.model.training:
-					self._get_model_without_dp().decorr_operations(b=b)
-					self._get_model_without_dp().mean_decorr_losses()	
+			if isinstance(self.get_model(), DecorrMamba):
+				if self.get_model().compute_loss or self.model.training:
+					self.get_model().decorr_operations()
+					# average decorrelation gradients and losses across each
+					# copy of the layer before updating parameters
+
+					if self.train_args.ddp:
+						self.sync_decorr()	
+
+					self.get_model().mean_decorr_losses()
+					# average the losses across the parallel models
+					if self.train_args.ddp:
+						self.sync_mean_losses()
 				
-				train_corr_loss = self._get_model_without_dp().mean_corr_loss
-				train_whit_loss = self._get_model_without_dp().mean_whit_loss
+				train_corr_loss = self.get_model().mean_corr_loss
+				train_whit_loss = self.get_model().mean_whit_loss
 
 				if train_corr_loss is not None:
 					train_corr_loss = train_corr_loss.item()
@@ -300,13 +388,14 @@ class MambaTrainer:
 				if train_whit_loss is not None:
 					train_whit_loss = train_whit_loss.item()
 					epoch_train_whit_loss += train_whit_loss
-				if step%log_freq == 0:
-					wandb.log({"train_corr_loss": train_corr_loss, 
-							"train_whit_loss": train_whit_loss}, step=step)	
+				
+				if no_ddp_or_main:
+					if step%log_freq == 0:
+						wandb.log({"train_corr_loss": train_corr_loss, 
+								"train_whit_loss": train_whit_loss}, step=step)	
 					
-
 				if train_decorr:
-					self._get_model_without_dp().update_decorr_matrices()
+					self.get_model().update_decorr_matrices()
 
 			# Condition checking if validate_every number of gradient descent
 			# steps have happened
@@ -318,13 +407,14 @@ class MambaTrainer:
 				epoch_train_corr_loss /= validate_every
 				epoch_train_whit_loss /= validate_every
 
-				print(f"\"Epoch\" train CE loss: {epoch_train_ce_loss:.4f}")
-				print(f"\"Epoch\" train perplexity: {epoch_train_ppl:.4f}")
-				if isinstance(self._get_model_without_dp(), DecorrMamba):	
-					if epoch_train_corr_loss > 0:		
-						print(f"\"Epoch\" train correlation loss: {epoch_train_corr_loss:.4f}")
-					if epoch_train_whit_loss > 0:						
-						print(f"\"Epoch\" train whitening loss: {epoch_train_whit_loss:.4f}")	
+				if no_ddp_or_main:
+					print(f"\"Epoch\" train CE loss: {epoch_train_ce_loss:.4f}")
+					print(f"\"Epoch\" train perplexity: {epoch_train_ppl:.4f}")
+					if isinstance(self.get_model(), DecorrMamba):	
+						if epoch_train_corr_loss > 0:		
+							print(f"\"Epoch\" train correlation loss: {epoch_train_corr_loss:.4f}")
+						if epoch_train_whit_loss > 0:						
+							print(f"\"Epoch\" train whitening loss: {epoch_train_whit_loss:.4f}")	
 				
 				# reset these values for the next "epoch"
 				epoch_train_ce_loss = 0.0
@@ -347,8 +437,12 @@ class MambaTrainer:
 
 				with torch.no_grad():
 					with torch.amp.autocast(self.device.type, enabled=use_amp):	
+
+						# fuse decorrelation matrices again, just once.
+						self.get_model().fuse_decorr()
 						
-						for next_batch in tqdm(val_loader):
+						for next_batch in maybe_tqdm(val_loader, 
+								   use_tqdm=no_ddp_or_main):
 							# if isinstance(self.model, DecorrMamba):
 							# 	# only resets the losses for the decorrelation layers
 							# 	# and the model
@@ -361,6 +455,9 @@ class MambaTrainer:
 							output_dim = pred.shape[-1]
 							loss = criterion(pred.view(-1, output_dim)[:,:self.mamba_args.vocab_size],
 											 target.view(-1))
+
+							if self.train_args.ddp:
+								loss = self.sync_tensor(loss)
 									
 							total_val_ce_loss += loss.item()
 							ppl = torch.exp(loss).item()
@@ -382,12 +479,13 @@ class MambaTrainer:
 
 				total_val_ce_loss /= len(val_loader)
 				total_val_ppl /= len(val_loader)
-				print(f"\n\"Epoch\" val perplexity: {total_val_ppl:.4f}")				
-				print(f"\"Epoch\" val CE loss: {total_val_ce_loss:.4f}")
 
-				wandb.log({
-					"val_ce_loss": total_val_ce_loss,
-					"val_ppl": total_val_ppl}, step=step)
+				if no_ddp_or_main:
+					print(f"\n\"Epoch\" val perplexity: {total_val_ppl:.4f}")				
+					print(f"\"Epoch\" val CE loss: {total_val_ce_loss:.4f}")
+					wandb.log({
+						"val_ce_loss": total_val_ce_loss,
+						"val_ppl": total_val_ppl}, step=step)
 				
 				# if isinstance(self.model, DecorrMamba):
 				# 	total_val_corr_loss /= len(val_loader)
@@ -398,14 +496,13 @@ class MambaTrainer:
 				# 		"val_corr_loss": total_val_corr_loss, 
 				# 		"val_whit_loss": total_val_whit_loss}, step=step)
 
-
-				if save_checkpoints:
-					torch.save({
-						"model_state": self.model.state_dict(),
-						"optimizer_state": optimizer.state_dict(),}, 
-						os.path.join(save_path, f"step_{step}.pth")) 
-					
-					wandb.save(os.path.join(save_path, f"step_{step}.pth"))
+					if save_checkpoints:
+						torch.save({
+							"model_state": self.model.state_dict(),
+							"optimizer_state": optimizer.state_dict(),}, 
+							os.path.join(save_path, f"step_{step}.pth")) 
+						
+						wandb.save(os.path.join(save_path, f"step_{step}.pth"))
 				
 				self.model.train()
 

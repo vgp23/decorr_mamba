@@ -24,10 +24,10 @@ class TrainingArgs():
 	lr: float
 	adam_beta: tuple 
 	adam_epsilon: float
-	parallel_gpus: bool
 
 	gradient_clip: float
 	weight_decay: float
+	ddp: bool
 
 	# parameters of the learning rate schedule
 	use_lr_sched: bool
@@ -134,7 +134,7 @@ class MambaArgs:
 		if self.delta_rank == "auto":
 			self.delta_rank = math.ceil(self.D/16)
 
-		# padding vocab size to be a nice number for parallel processing. If using
+		# padding vocab size to be a nice number for GPU use. If using
 		# the full vocab size of the tokenizer, we pad with extra tokens that are
 		# never used. If using smaller than the full vocab size, whatever number the
 		# user inputs will be rounded up to a nice value
