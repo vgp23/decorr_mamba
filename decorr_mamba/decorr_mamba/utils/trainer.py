@@ -42,13 +42,15 @@ class MambaTrainer:
 	'''
 	def __init__(self, 
 			mamba_args: MambaConfig, train_args: TrainingArgs, 
-			model: MambaLMHeadModel):
+			model: MambaLMHeadModel, rank: int, local_rank: int):
 
 		self.mamba_args = mamba_args
 		self.train_args = train_args
 		self.model = model
-
-		self.device = self.get_model().lm_head.weight.device
+		self.local_rank = local_rank
+		self.rank = rank
+		self.is_main = rank == 0
+		self.device = torch.device(f'cuda:{local_rank}')
 
 		def _add_param_to_groups(module, param_groups):
 			'''
@@ -138,8 +140,7 @@ class MambaTrainer:
 
 	def train_sequence_steps(self, train_loader: DataLoader, val_loader: DataLoader, 
 		use_amp: bool, log_freq: int, n_val: int, train_backprop: bool=True, 
-		train_decorr: bool=True, save_checkpoints: bool=True, pad_idx: int = None,
-		rank: int=None):
+		train_decorr: bool=True, save_checkpoints: bool=True, pad_idx: int = None):
 
 		''' 
 		Trains the model with the protocol specified in train_args. Trains based
@@ -147,9 +148,9 @@ class MambaTrainer:
 		at pre-defined points within the training loop. 
 
 		'''
-		def maybe_tqdm(iterator, use_tqdm):
+		def maybe_tqdm(iterator):
 			""" Useful for controlling console printouts during DDP training"""
-			return tqdm(iterator) if use_tqdm else iterator
+			return tqdm(iterator) if self.is_main else iterator
 
 		# Index used for sequence length padding in proteome modelling task
 		if pad_idx:
@@ -157,12 +158,7 @@ class MambaTrainer:
 		else:
 			criterion = nn.CrossEntropyLoss()
 
-		# only want to log things to wandb if we're not training with ddp, or 
-		# if we're in the rank-0 process within ddp. This flag keeps track
-		# of that and is more legible
-		no_ddp_or_main = (self.train_args.ddp and rank == 0) or rank == None
-
-		if no_ddp_or_main:
+		if self.is_main:
 			if not train_backprop:
 				print("Warning: not training backpropagation parameters!")
 			if not train_decorr:
@@ -187,7 +183,7 @@ class MambaTrainer:
 				
 			elif self.train_args.optimizer == "soap":
 				
-				if no_ddp_or_main:
+				if self.is_main:
 					print("\nUsing SOAP optimizer!")
 
 				# stick to default values for now
@@ -221,7 +217,7 @@ class MambaTrainer:
 											eps=self.train_args.adam_epsilon) 
 			elif self.train_args.optimizer == "soap":
 				
-				if no_ddp_or_main:
+				if self.is_main:
 					print("\nUsing SOAP optimizer!")
 
 				# stick to default values for now
@@ -264,8 +260,7 @@ class MambaTrainer:
 		if hasattr(train_loader.sampler, "set_epoch"):
 			train_loader.sampler.set_epoch(epoch)
 
-		for step in maybe_tqdm(range(1, self.train_args.n_steps+1), 
-						 use_tqdm=no_ddp_or_main):
+		for step in maybe_tqdm(range(1, self.train_args.n_steps+1)):
 			# an infinite loop for the fixed number of gradient descent 
 			# steps
 			try:
@@ -311,10 +306,9 @@ class MambaTrainer:
 			ppl = torch.exp(loss_tensor).item()
 			epoch_train_ppl += ppl
 
-			if no_ddp_or_main:
-				if step%log_freq == 0:
-					wandb.log({"train_ce_loss": loss_tensor.item(), 
-								"train_ppl": ppl}, step=step)					
+			if step%log_freq == 0:
+				wandb.log({"train_ce_loss": loss_tensor.item(), 
+							"train_ppl": ppl}, step=step)					
 
 			if train_backprop:
 				scaler.scale(loss).backward()
@@ -389,10 +383,9 @@ class MambaTrainer:
 					train_whit_loss = train_whit_loss.item()
 					epoch_train_whit_loss += train_whit_loss
 				
-				if no_ddp_or_main:
-					if step%log_freq == 0:
-						wandb.log({"train_corr_loss": train_corr_loss, 
-								"train_whit_loss": train_whit_loss}, step=step)	
+				if step%log_freq == 0:
+					wandb.log({"train_corr_loss": train_corr_loss, 
+							"train_whit_loss": train_whit_loss}, step=step)	
 					
 				if train_decorr:
 					self.get_model().update_decorr_matrices()
@@ -407,7 +400,7 @@ class MambaTrainer:
 				epoch_train_corr_loss /= validate_every
 				epoch_train_whit_loss /= validate_every
 
-				if no_ddp_or_main:
+				if self.is_main:
 					print(f"\"Epoch\" train CE loss: {epoch_train_ce_loss:.4f}")
 					print(f"\"Epoch\" train perplexity: {epoch_train_ppl:.4f}")
 					if isinstance(self.get_model(), DecorrMamba):	
@@ -441,8 +434,7 @@ class MambaTrainer:
 						# fuse decorrelation matrices again, just once.
 						self.get_model().fuse_decorr()
 						
-						for next_batch in maybe_tqdm(val_loader, 
-								   use_tqdm=no_ddp_or_main):
+						for next_batch in maybe_tqdm(val_loader):
 							# if isinstance(self.model, DecorrMamba):
 							# 	# only resets the losses for the decorrelation layers
 							# 	# and the model
@@ -480,7 +472,7 @@ class MambaTrainer:
 				total_val_ce_loss /= len(val_loader)
 				total_val_ppl /= len(val_loader)
 
-				if no_ddp_or_main:
+				if self.is_main:
 					print(f"\n\"Epoch\" val perplexity: {total_val_ppl:.4f}")				
 					print(f"\"Epoch\" val CE loss: {total_val_ce_loss:.4f}")
 					wandb.log({
