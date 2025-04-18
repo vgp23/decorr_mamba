@@ -432,7 +432,8 @@ class MambaTrainer:
 					with torch.amp.autocast(self.device.type, enabled=use_amp):	
 
 						# fuse decorrelation matrices again, just once.
-						self.get_model().fuse_decorr()
+						if isinstance(self.get_model(), DecorrMamba):
+							self.get_model().fuse_decorr()
 						
 						for next_batch in maybe_tqdm(val_loader):
 							# if isinstance(self.model, DecorrMamba):
