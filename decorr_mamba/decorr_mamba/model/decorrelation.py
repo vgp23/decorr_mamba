@@ -294,11 +294,10 @@ class DecorrLinear(DecorrMixin, nn.Linear):
 			# sample a subset of the logged inputs
 			b = x.shape[0]
 			num_samples = int(self.sample_frac * b)
-			# indices = torch.randint(0, b, (num_samples,)).to(
-			# 	next(self.parameters()).device)		
+			if num_samples < 1:
+				num_samples = 1
 			
 			subset = x[torch.randperm(b, device=x.device)[:num_samples]]
-
 
 			# forward pass this through the decorrelation matrix
 			decorr_out = subset @ self.decorr_layer.T
@@ -400,16 +399,17 @@ class DecorrConv1d(DecorrMixin, nn.Conv1d):
 
 		with torch.no_grad():
 
-			b = x.shape[0]
-			d_inner = x.shape[1]
+			b, d_inner, _ = x.shape
 			num_samples = int(self.sample_frac * b)
+			if num_samples < 1:
+				num_samples = 1
 
 			# select a subset of the logged inputs
 			subset = x[torch.randperm(b, device=x.device)[:num_samples]]
 
-			# forward pass this through the decorrelation matrix
+			# get patches that the convolutional kernel would see
 			# all data in each convolution patch is represented in a single vector
-			# (B, n_patches, conv_1d_size*D)
+			# (B, conv_1d_size*D, n_patches)
 			x_unfolded = F.unfold(
 				subset.unsqueeze(1), 
 				(d_inner, self.kernel_size[0]), 
@@ -417,11 +417,11 @@ class DecorrConv1d(DecorrMixin, nn.Conv1d):
 			
 			# reshapes all inputs as corresponding convolutional "patches"
 			patch_matrices = x_unfolded.reshape(
-				num_samples, d_inner, -1, self.kernel_size[0])
+				num_samples, d_inner, self.kernel_size[0], -1)
 			
 			# perform decorrelation operation
 			decorr_out = einsum(self.decorr_layer, patch_matrices,
-				'd conv_1d_size dummy, n_samples d n_patches dummy -> n_samples n_patches d conv_1d_size')
+				'd conv_1d_size dummy, n_samples d dummy n_patches -> n_samples n_patches d conv_1d_size')
 			
 			grad, corr_loss, whit_loss = self.loss_module(
 				decorr_out, self.kappa, self.training, self.compute_loss, batched=True)

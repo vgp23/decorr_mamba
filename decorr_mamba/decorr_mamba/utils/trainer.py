@@ -140,7 +140,8 @@ class MambaTrainer:
 
 	def train_sequence_steps(self, train_loader: DataLoader, val_loader: DataLoader, 
 		use_amp: bool, log_freq: int, n_val: int, train_backprop: bool=True, 
-		train_decorr: bool=True, save_checkpoints: bool=True, pad_idx: int = None):
+		train_decorr: bool=True, save_checkpoints: bool=True, pad_idx: int = None,
+		skip_init_val: bool=False, datashuffle_seed: int=0):
 
 		''' 
 		Trains the model with the protocol specified in train_args. Trains based
@@ -167,6 +168,10 @@ class MambaTrainer:
 
 			if not isinstance(self.get_model(), DecorrMamba) and train_decorr:
 				print("Warning: train_decorr set to True but model does not use decorrelation!")
+			
+			if isinstance(self.get_model(), DecorrMamba):
+				if int(self.train_args.B*self.get_model().sample_frac) < 1:
+					print("Warning: decorrelation sub-sampling too small, will use 1 batch instead.\n")
 
 		if self.train_args.weight_decay is not None:
 			if self.train_args.optimizer == "adam":
@@ -258,9 +263,50 @@ class MambaTrainer:
 
 		epoch = 0 # needed for shuffling of multi-gpu data samplers
 		if hasattr(train_loader.sampler, "set_epoch"):
-			train_loader.sampler.set_epoch(epoch)
+			train_loader.sampler.set_epoch(datashuffle_seed + epoch)
 
 		for step in maybe_tqdm(range(1, self.train_args.n_steps+1)):
+			# initial validation before training
+			if step == 1 and not skip_init_val:
+				self.model.eval()
+				total_val_ce_loss = 0.0
+				total_val_ppl = 0.0
+
+				with torch.no_grad():
+					with torch.amp.autocast(self.device.type, enabled=use_amp):	
+
+						if isinstance(self.get_model(), DecorrMamba):
+							self.get_model().fuse_decorr()
+						
+						for next_batch in maybe_tqdm(val_loader):
+
+							in_seq = next_batch.long().to(self.device, non_blocking=True)
+							pred = self.model(in_seq[:,:-1]).logits
+							target = in_seq[:,1:].contiguous()
+
+							output_dim = pred.shape[-1]
+							loss = criterion(pred.view(-1, output_dim)[:,:self.mamba_args.vocab_size],
+											 target.view(-1))
+
+							if self.train_args.ddp:
+								loss = self.sync_tensor(loss)
+									
+							total_val_ce_loss += loss.item()
+							ppl = torch.exp(loss).item()
+							total_val_ppl += ppl
+
+				total_val_ce_loss /= len(val_loader)
+				total_val_ppl /= len(val_loader)
+
+				if self.is_main:
+					print(f"Initial val perplexity: {total_val_ppl:.4f}")				
+					print(f"Initial val CE loss: {total_val_ce_loss:.4f}")
+					wandb.log({
+						"val_ce_loss": total_val_ce_loss,
+						"val_ppl": total_val_ppl}, step=step)
+						
+				self.model.train()	
+
 			# an infinite loop for the fixed number of gradient descent 
 			# steps
 			try:
@@ -268,7 +314,7 @@ class MambaTrainer:
 			except StopIteration:
 				epoch += 1
 				if hasattr(train_loader.sampler, "set_epoch"):
-					train_loader.sampler.set_epoch(epoch)
+					train_loader.sampler.set_epoch(datashuffle_seed + epoch)
 				train_iterator = iter(train_loader)  # Reset the iterator
 				next_batch = next(train_iterator)
 
