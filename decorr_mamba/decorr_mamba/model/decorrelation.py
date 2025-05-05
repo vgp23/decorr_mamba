@@ -1,7 +1,7 @@
 import torch
 import time
 import torch.nn as nn
-from einops import einsum, rearrange
+from einops import einsum, rearrange, repeat
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from functools import partial
 from copy import deepcopy
@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.nn.functional import linear, conv1d
 from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.utils.torch import custom_fwd, custom_bwd
+import math
 
 import selective_scan_cuda
 
@@ -23,7 +24,7 @@ try:
 except ImportError:
 	selective_state_update = None
 
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, MambaInnerFn, rms_norm_forward
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, MambaInnerFn, rms_norm_forward, mamba_inner_fn
 
 class DecorrLoss(nn.Module):
 	"""
