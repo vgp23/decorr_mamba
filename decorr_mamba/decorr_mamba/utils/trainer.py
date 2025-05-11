@@ -264,7 +264,6 @@ class MambaTrainer:
 		epoch = 0 # needed for shuffling of multi-gpu data samplers
 		if hasattr(train_loader.sampler, "set_epoch"):
 			train_loader.sampler.set_epoch(datashuffle_seed + epoch)
-
 		for step in maybe_tqdm(range(1, self.train_args.n_steps+1)):
 			# initial validation before training
 			if step == 1 and not skip_init_val:
@@ -282,6 +281,7 @@ class MambaTrainer:
 
 							in_seq = next_batch.long().to(self.device, non_blocking=True)
 							pred = self.model(in_seq[:,:-1]).logits
+
 							target = in_seq[:,1:].contiguous()
 
 							output_dim = pred.shape[-1]
@@ -356,8 +356,12 @@ class MambaTrainer:
 				wandb.log({"train_ce_loss": loss_tensor.item(), 
 							"train_ppl": ppl}, step=step)					
 
+			print("PASSED FORWARD")
+			
 			if train_backprop:
 				scaler.scale(loss).backward()
+			
+			print("PASSED BACKWARD")
 
 			# gradient clipping
 			if self.train_args.gradient_clip is not None:
@@ -489,6 +493,7 @@ class MambaTrainer:
 
 							in_seq = next_batch.long().to(self.device, non_blocking=True)
 							pred = self.model(in_seq[:,:-1]).logits
+								
 							target = in_seq[:,1:].contiguous()
 
 							output_dim = pred.shape[-1]
