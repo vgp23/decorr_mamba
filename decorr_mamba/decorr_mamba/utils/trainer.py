@@ -5,6 +5,7 @@ import torch.nn as nn
 from tqdm import tqdm 
 import os
 import json
+import matplotlib.pyplot as plt
 import wandb
 
 from ..utils.helpers import TrainingArgs
@@ -17,8 +18,26 @@ from ..utils.SOAP.soap import SOAP
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 
+def generate_fixed_exponential_schedule(num_iterations, num_validations):
+	"""
+	Generate exactly `num_validations` validation points exponentially spaced 
+	from 0 to num_iterations - 1. Used to determine when to validate in the 
+	training loop. 
+	"""
+	# Generate exponentially spaced points in the range [0, 1]
+	exp_positions = np.logspace(0, 1, num=num_validations+1, base=20, endpoint=True) - 1
+	exp_positions /= exp_positions[-1]  # Normalize to [0, 1]
 
-# os.environ["WANDB_SILENT"] = "true"
+	# Map these points to the iteration range [0, num_iterations - 1]
+	validation_schedule = np.round(exp_positions * (num_iterations - 1)).astype(int)
+
+	# Ensure the last validation is at the final iteration
+	validation_schedule[-1] = num_iterations - 1
+
+	# We validate at 0 separately, exclude this from here (1 was added to length above,
+	# to compensate for this)
+	
+	return validation_schedule[1:]
 
 class MambaTrainer:
 	''' Trains a Mamba architecture according to a pre-specified configuration
@@ -137,11 +156,10 @@ class MambaTrainer:
 				self.get_model().mean_whit_loss, op=torch.distributed.ReduceOp.SUM)
 			self.get_model().mean_whit_loss /= world_size	
 
-
 	def train_sequence_steps(self, train_loader: DataLoader, val_loader: DataLoader, 
 		use_amp: bool, log_freq: int, n_val: int, train_backprop: bool=True, 
 		train_decorr: bool=True, save_checkpoints: bool=True, pad_idx: int = None,
-		skip_init_val: bool=False, datashuffle_seed: int=0):
+		skip_init_val: bool=False, datashuffle_seed: int=0, metric="ppl"):
 
 		''' 
 		Trains the model with the protocol specified in train_args. Trains based
@@ -172,6 +190,8 @@ class MambaTrainer:
 			if isinstance(self.get_model(), DecorrMamba):
 				if int(self.train_args.B*self.get_model().sample_frac) < 1:
 					print("Warning: decorrelation sub-sampling too small, will use 1 batch instead.\n")
+			
+			assert metric == "ppl" or metric == "bpb", "Metric must be either perplexity (ppl) or bits per byte (bpb)"
 
 		if self.train_args.weight_decay is not None:
 			if self.train_args.optimizer == "adam":
@@ -241,20 +261,20 @@ class MambaTrainer:
 		if self.train_args.use_lr_sched:
 			scheduler = torch.optim.lr_scheduler.LambdaLR(
 				optimizer, lr_lambda=self.train_args.schedule_fn)
+			# visualize learning rate schedule
+			self.train_args.show_lr_schedule()
+			plt.savefig(os.path.join('.', "schedule.png"))
+			
 		
 		save_path = os.path.join(".", "checkpoints")
 		os.makedirs(save_path, exist_ok=True)
 
 		scaler = torch.amp.GradScaler(self.device.type, enabled=use_amp)
 
-		validate_every = int(self.train_args.n_steps/n_val)
+		val_sched = generate_fixed_exponential_schedule(
+			num_iterations=self.train_args.n_steps, num_validations=n_val)
+		
 		train_iterator = iter(train_loader)
-
-		# "epoch" isn't quite correct here, but alas
-		epoch_train_ce_loss = 0.0
-		epoch_train_ppl = 0.0
-		epoch_train_corr_loss = 0.0
-		epoch_train_whit_loss = 0.0
 
 		if train_backprop:
 			self.model.train()
@@ -264,12 +284,13 @@ class MambaTrainer:
 		epoch = 0 # needed for shuffling of multi-gpu data samplers
 		if hasattr(train_loader.sampler, "set_epoch"):
 			train_loader.sampler.set_epoch(datashuffle_seed + epoch)
+
 		for step in maybe_tqdm(range(1, self.train_args.n_steps+1)):
 			# initial validation before training
 			if step == 1 and not skip_init_val:
 				self.model.eval()
 				total_val_ce_loss = 0.0
-				total_val_ppl = 0.0
+				total_val_metric = 0.0
 
 				with torch.no_grad():
 					with torch.amp.autocast(self.device.type, enabled=use_amp):	
@@ -292,18 +313,23 @@ class MambaTrainer:
 								loss = self.sync_tensor(loss)
 									
 							total_val_ce_loss += loss.item()
-							ppl = torch.exp(loss).item()
-							total_val_ppl += ppl
+							if metric == "ppl":
+								total_val_metric += torch.exp(loss).item()
+							elif metric == "bpb":
+								total_val_metric += (loss * torch.log2(
+									torch.tensor(torch.e))).item()
+							else:
+								raise NotImplementedError
 
 				total_val_ce_loss /= len(val_loader)
-				total_val_ppl /= len(val_loader)
+				total_val_metric /= len(val_loader)
 
 				if self.is_main:
-					print(f"Initial val perplexity: {total_val_ppl:.4f}")				
+					print(f"Initial val {metric}: {total_val_metric:.4f}")				
 					print(f"Initial val CE loss: {total_val_ce_loss:.4f}")
 					wandb.log({
 						"val_ce_loss": total_val_ce_loss,
-						"val_ppl": total_val_ppl}, step=step)
+						f"val_{metric}": total_val_metric}, step=step)
 						
 				self.model.train()	
 
@@ -348,21 +374,21 @@ class MambaTrainer:
 			if self.train_args.ddp:
 				loss_tensor = self.sync_tensor(loss_tensor)
 
-			epoch_train_ce_loss += loss_tensor.item()
-			ppl = torch.exp(loss_tensor).item()
-			epoch_train_ppl += ppl
+			if metric == "ppl":
+				batch_metric = torch.exp(loss_tensor).item()
+			elif metric == "bpb":
+				batch_metric = (loss_tensor * torch.log2(
+					torch.tensor(torch.e))).item()
+			else:
+				raise NotImplementedError
 
 			if step%log_freq == 0:
 				wandb.log({"train_ce_loss": loss_tensor.item(), 
-							"train_ppl": ppl}, step=step)					
-
-			print("PASSED FORWARD")
+							f"train_{metric}": batch_metric}, step=step)					
 			
 			if train_backprop:
 				scaler.scale(loss).backward()
 			
-			print("PASSED BACKWARD")
-
 			# gradient clipping
 			if self.train_args.gradient_clip is not None:
 				scaler.unscale_(optimizer)
@@ -428,10 +454,8 @@ class MambaTrainer:
 
 				if train_corr_loss is not None:
 					train_corr_loss = train_corr_loss.item()
-					epoch_train_corr_loss += train_corr_loss
 				if train_whit_loss is not None:
 					train_whit_loss = train_whit_loss.item()
-					epoch_train_whit_loss += train_whit_loss
 				
 				if step%log_freq == 0:
 					wandb.log({"train_corr_loss": train_corr_loss, 
@@ -443,27 +467,7 @@ class MambaTrainer:
 			# Condition checking if validate_every number of gradient descent
 			# steps have happened
 			
-			if step%validate_every == 0:
-				
-				epoch_train_ce_loss /= 	validate_every
-				epoch_train_ppl /= validate_every			
-				epoch_train_corr_loss /= validate_every
-				epoch_train_whit_loss /= validate_every
-
-				if self.is_main:
-					print(f"\"Epoch\" train CE loss: {epoch_train_ce_loss:.4f}")
-					print(f"\"Epoch\" train perplexity: {epoch_train_ppl:.4f}")
-					if isinstance(self.get_model(), DecorrMamba):	
-						if epoch_train_corr_loss > 0:		
-							print(f"\"Epoch\" train correlation loss: {epoch_train_corr_loss:.4f}")
-						if epoch_train_whit_loss > 0:						
-							print(f"\"Epoch\" train whitening loss: {epoch_train_whit_loss:.4f}")	
-				
-				# reset these values for the next "epoch"
-				epoch_train_ce_loss = 0.0
-				epoch_train_corr_loss = 0.0
-				epoch_train_whit_loss = 0.0
-				epoch_train_ppl = 0.0
+			if step in val_sched:
 
 				# -------------------------------- validation -------------------------------------	
 
@@ -474,7 +478,7 @@ class MambaTrainer:
 				self.model.eval()
 
 				total_val_ce_loss = 0.0
-				total_val_ppl = 0.0
+				total_val_metric = 0.0
 				# total_val_corr_loss = 0.0
 				# total_val_whit_loss = 0.0	
 
@@ -504,8 +508,13 @@ class MambaTrainer:
 								loss = self.sync_tensor(loss)
 									
 							total_val_ce_loss += loss.item()
-							ppl = torch.exp(loss).item()
-							total_val_ppl += ppl
+
+							if metric == "ppl":
+								total_val_metric += torch.exp(loss).item()
+							elif metric == "bpb":
+								total_val_metric += (loss * torch.log2(
+									torch.tensor(torch.e))).item()
+
 
 							# if isinstance(self.model, DecorrMamba):
 							# 	# only compute losses of decorr matrices,
@@ -522,14 +531,14 @@ class MambaTrainer:
 							# 		total_val_whit_loss += val_whit_loss.item()				
 
 				total_val_ce_loss /= len(val_loader)
-				total_val_ppl /= len(val_loader)
+				total_val_metric /= len(val_loader)
 
 				if self.is_main:
-					print(f"\n\"Epoch\" val perplexity: {total_val_ppl:.4f}")				
-					print(f"\"Epoch\" val CE loss: {total_val_ce_loss:.4f}")
+					print(f"\nStep {step} val {metric}: {total_val_metric:.4f}")				
+					print(f"Step {step} val CE loss: {total_val_ce_loss:.4f}")
 					wandb.log({
 						"val_ce_loss": total_val_ce_loss,
-						"val_ppl": total_val_ppl}, step=step)
+						f"val_{metric}": total_val_metric}, step=step)
 				
 				# if isinstance(self.model, DecorrMamba):
 				# 	total_val_corr_loss /= len(val_loader)
@@ -549,4 +558,3 @@ class MambaTrainer:
 						wandb.save(os.path.join(save_path, f"step_{step}.pth"))
 				
 				self.model.train()
-

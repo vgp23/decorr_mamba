@@ -11,6 +11,7 @@ from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.utils.torch import custom_fwd, custom_bwd
 import math
 from decorr_mamba.model.sashimi_mamba import SaShiMiMamba
+from collections import namedtuple
 
 import selective_scan_cuda
 
@@ -262,29 +263,6 @@ class DecorrLinear(DecorrMixin, nn.Linear):
 		inputs through both matrices separately."""
 
 		self.fused_weight = self.weight @ self.decorr_layer
-		
-		
-	# def reshape_decorr_inputs(self, x, b):
-	# 	"""Reshapes the captured inputs for gradient computation.
-
-	# 	Args:
-	# 		x (torch.Tensor): Input tensor.
-	# 		b (int): Batch size.
-
-	# 	Returns:
-	# 		torch.Tensor: Reshaped input tensor.
-	# 	"""
-	# 	# Can't get the batch size dynamically, because the batch and length 
-	# 	# dimensions are collapsed together in the in_proj layers during the 
-	# 	# selective scan algorithm. 
-	# 	if self.reshape_type == "in_proj":
-	# 		return x.reshape((self.in_features, b, -1)).permute(1, 2, 0)
-			
-	# 	elif self.reshape_type == "x_proj":
-	# 		return x.reshape((b, -1, self.in_features))	
-		
-	# 	else:
-	# 		return x
 			
 	def compute_decorr_grad_loss(self, x):
 		"""Computes decorrelation losses and gradients.
@@ -670,7 +648,7 @@ class DecorrMamba(MambaLMHeadModel):
 		if not self.complex:
 			A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
 		else:
-			A = -torch.exp(self.log_A_real) + 1j * self.A_imag
+			A = torch.complex(-torch.exp(self.log_A_real), self.A_imag)
 			
 		# In the backward pass we write dx and dz next to each other to avoid torch.cat
 		if self.use_fast_path and causal_conv1d_fn is not None and inference_params is None:  # Doesn't support outputting the states
@@ -778,7 +756,11 @@ class DecorrMamba(MambaLMHeadModel):
 		# Don't add dt_bias here
 
 		dt = F.linear(dt, self.dt_proj.weight)  # (B d_inner)
-		A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
+
+		if not self.is_complex:
+			A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
+		else:
+			A = torch.complex(-torch.exp(self.log_A_real), self.A_imag)
 
 		# SSM step
 		if selective_state_update is None:
@@ -801,7 +783,6 @@ class DecorrMamba(MambaLMHeadModel):
 	def forward(self, x):
 		# fuse decorrelation + main model parameters, then let forward
 		# pass proceed as normal
-		print("NEW FORWARD")
 		if self.training:
 			self.fuse_decorr()
 		return super().forward(x)
@@ -974,8 +955,8 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 			residuals.append(x)
 			x = blocks(x)
 			# inputs are captured by Mamba blocks separately
-			if isinstance(dp, DecorrLinear):
-				dp.inputs = x
+			if isinstance(dp.down_pool, DecorrLinear):
+				dp.capture_inputs = True
 			x = dp(x)
 
 		residuals.append(x)
@@ -987,11 +968,13 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 		# up-sampling!
 		for up, blocks in zip(
 			reversed(self.up_pooling), reversed(self.mamba_stages_up)):
-			if isinstance(up, DecorrLinear):
-				up.inputs = x
+			if isinstance(up.up_pool, DecorrLinear):
+				up.capture_inputs = True
 			u = up(x)
 			x = u + residuals.pop()
 			x = blocks(x)
 	
-		return x
+		lm_logits = self.lm_head(x)
+		CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
+		return CausalLMOutput(logits=lm_logits)
 

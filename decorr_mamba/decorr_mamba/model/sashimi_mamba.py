@@ -119,10 +119,14 @@ class DownPool(nn.Module):
 		device = factory_kwargs.get("device")
 		dtype = factory_kwargs.get("dtype")
 		self.down_pool = nn.Linear(p*H, q*H, dtype=dtype, device=device)
+		self.capture_inputs = False # Captures linear layerinputs during decorr training
 
 	def forward(self, x):
 		B, L, _ = x.shape
 		reshaped = x.reshape(B, -1, self.H*self.p)
+		if self.capture_inputs:
+			self.down_pool.inputs = reshaped.detach()
+			self.capture_inputs = False
 		down_sampled = self.down_pool(reshaped)
 		return down_sampled 
 
@@ -136,9 +140,13 @@ class UpPool(nn.Module):
 		device = factory_kwargs.get('device')
 		dtype = factory_kwargs.get("dtype")
 		self.up_pool = nn.Linear(H, int(p*H/q), dtype=dtype, device=device)
+		self.capture_inputs = False # Captures linear layer inputs during decorr training
 
 	def forward(self, x):
 		B, _, _ = x.shape
+		if self.capture_inputs:
+			self.up_pool.inputs = x.detach()
+			self.capture_inputs = False
 		up_sampled = self.up_pool(x)
 		# shift to maintain causality
 		up_sampled = F.pad(up_sampled[:, :-1, :], (0,0,1,0)) 
