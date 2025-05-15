@@ -27,8 +27,7 @@ from mamba_ssm.models.config_mamba import MambaConfig
 import torch
 
 device = torch.device("cuda")
-mamba_args = MambaConfig(d_model=64,
-						   vocab_size=256)
+mamba_args = MambaConfig(d_model=64, vocab_size=256)
 
 model = DecorrMamba(config=mamba_args, device=device)
 ```
