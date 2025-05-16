@@ -47,7 +47,7 @@ class TrainingArgs():
 		assert self.n_steps is not None, "Must specify n_steps"
 		if self.use_lr_sched:
 			assert self.warmup_steps is not None, "Warmup epochs/steps specification missing"
-			assert self.warmup_steps < self.n_steps, "Warmup epochs/steps > total epochs/steps"
+			assert self.warmup_steps <= self.n_steps, "Warmup epochs/steps > total epochs/steps"
 
 			self.schedule_fn: Callable[[int], float] = self._lm_learning_schedule
 
@@ -78,15 +78,15 @@ class TrainingArgs():
 		for step in steps:
 			lrs[step] = self.lr*self._lm_learning_schedule(step)
 
-		min_lr = np.min(lrs[self.warmup_steps+1:])
-		max_lr = np.max(lrs)
+		# min_lr = np.min(lrs[self.warmup_steps+1:])
+		# max_lr = np.max(lrs)
 
 		plt.figure()
 		plt.plot(steps, lrs)
 		plt.xlim([0,self.n_steps-1])
 		plt.xlabel("Step")
 		plt.ylabel("Learning rate")
-		plt.title(f"Max = {max_lr}, \nMin = {min_lr:.2e}")
+		# plt.title(f"Max = {max_lr}, \nMin = {min_lr:.2e}")
 		plt.show()
 
 

@@ -19,13 +19,13 @@ from ..utils.SOAP.soap import SOAP
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 
-def generate_fixed_exponential_schedule(num_iterations, num_validations):
+def generate_fixed_exponential_schedule(num_iterations, num_validations, base):
     """
     Generate exactly `num_validations` validation points exponentially spaced 
     from 0 to num_iterations - 1.
     """
     # Generate exponentially spaced points in the range [0, 1]
-    exp_positions = np.logspace(0, 1, num=num_validations+1, base=20, endpoint=True) - 1
+    exp_positions = np.logspace(0, 1, num=num_validations+1, base=base, endpoint=True) - 1
     exp_positions /= exp_positions[-1]  # Normalize to [0, 1]
 
     # Map these points to the iteration range [0, num_iterations - 1]
@@ -160,7 +160,7 @@ class MambaTrainer:
 	def train_sequence_steps(self, train_loader: DataLoader, val_loader: DataLoader, 
 		use_amp: bool, log_freq: int, n_val: int, train_backprop: bool=True, 
 		train_decorr: bool=True, save_checkpoints: bool=True, pad_idx: int = None,
-		skip_init_val: bool=False, datashuffle_seed: int=0, metric="ppl"):
+		skip_init_val: bool=False, datashuffle_seed: int=0, metric="ppl", val_sched_base: int=20):
 
 		''' 
 		Trains the model with the protocol specified in train_args. Trains based
@@ -273,7 +273,7 @@ class MambaTrainer:
 		scaler = torch.amp.GradScaler(self.device.type, enabled=use_amp)
 
 		val_sched = generate_fixed_exponential_schedule(
-			num_iterations=self.train_args.n_steps, num_validations=n_val)
+			num_iterations=self.train_args.n_steps, num_validations=n_val, base=val_sched_base)
 		
 		train_iterator = iter(train_loader)
 
