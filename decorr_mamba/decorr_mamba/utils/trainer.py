@@ -7,6 +7,7 @@ import os
 import json
 import matplotlib.pyplot as plt
 import wandb
+import numpy as np
 
 from ..utils.helpers import TrainingArgs
 from ..model.decorrelation import DecorrMamba
@@ -19,25 +20,25 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 def generate_fixed_exponential_schedule(num_iterations, num_validations):
-	"""
-	Generate exactly `num_validations` validation points exponentially spaced 
-	from 0 to num_iterations - 1. Used to determine when to validate in the 
-	training loop. 
-	"""
-	# Generate exponentially spaced points in the range [0, 1]
-	exp_positions = np.logspace(0, 1, num=num_validations+1, base=20, endpoint=True) - 1
-	exp_positions /= exp_positions[-1]  # Normalize to [0, 1]
+    """
+    Generate exactly `num_validations` validation points exponentially spaced 
+    from 0 to num_iterations - 1.
+    """
+    # Generate exponentially spaced points in the range [0, 1]
+    exp_positions = np.logspace(0, 1, num=num_validations+1, base=20, endpoint=True) - 1
+    exp_positions /= exp_positions[-1]  # Normalize to [0, 1]
 
-	# Map these points to the iteration range [0, num_iterations - 1]
-	validation_schedule = np.round(exp_positions * (num_iterations - 1)).astype(int)
+    # Map these points to the iteration range [0, num_iterations - 1]
+    validation_schedule = np.unique(
+    	np.round(exp_positions * (num_iterations - 1))).astype(int)
 
-	# Ensure the last validation is at the final iteration
-	validation_schedule[-1] = num_iterations - 1
+    # Ensure the last validation is at the final iteration
+    validation_schedule[-1] = num_iterations
 
-	# We validate at 0 separately, exclude this from here (1 was added to length above,
-	# to compensate for this)
-	
-	return validation_schedule[1:]
+    # We validate at 0 separately, exclude this from here (1 was added to length above,
+    # to compensate for this)
+
+    return validation_schedule[1:]
 
 class MambaTrainer:
 	''' Trains a Mamba architecture according to a pre-specified configuration

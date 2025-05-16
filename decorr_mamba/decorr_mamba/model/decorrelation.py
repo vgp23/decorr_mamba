@@ -535,6 +535,8 @@ def decorr_mamba_inner_fn(
 							delta_softplus, checkpoint_lvl, b_rms_weight, 
 							c_rms_weight, dt_rms_weight, b_c_dt_rms_eps)
 
+
+
 class DecorrMamba(MambaLMHeadModel):
 	"""Extends MambaLMHeadModel by integrating decorrelation layers into the architecture."""
 
@@ -871,9 +873,10 @@ class DecorrMamba(MambaLMHeadModel):
 		self.apply_to_decorr(
 			lambda x: setattr(x, 'compute_loss', compute_loss))
 
-class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
-	""" Decorrelated version of SaShiMiMamba."""
-	def __init__(self, existing_model: SaShiMiMamba = None, copy: bool = False, 
+
+class DecorrMamba2(DecorrMamba):
+	""" Decorrelated version of Mamba2."""
+	def __init__(self, existing_model: MambaLMHeadModel = None, copy: bool = False, 
 			  kappa: float = 0.5, sample_frac: float = 0.1, decorr_lr: float = None,
 			  compute_loss: bool = True, **factory_kwargs):
 		
@@ -882,13 +885,14 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 			if factory_kwargs.get("config") is not None:
 				print(
 					"Warning: supplied config overwritten by the config of the existing model")
+				
 		elif existing_model:
 			self.__dict__.update(existing_model.__dict__)
 			if factory_kwargs.get("config") is not None:
 				print(
 					"Warning: supplied config overwritten by the config of the existing model")			
 		else:
-			SaShiMiMamba.__init__(self, **factory_kwargs)
+			MambaLMHeadModel.__init__(self, **factory_kwargs)
 
 		self.n_decorr_layers = 0 # used for averaging the decorr losses later
 		# used for referencing decorrelation layers directly without looping
@@ -904,6 +908,119 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 				module (nn.Module): model layers to add decorrelation into 
 			"""
 			decorr_linear_names = ["in_proj", "out_proj", "x_proj", "up_pool", "down_pool"]
+
+			for name, child in module.named_children():
+				if name in decorr_linear_names:
+					self.n_decorr_layers += 1
+					setattr(module, name, DecorrLinear.from_existing_layer(
+						original_layer=child, compute_loss=compute_loss, 
+						kappa=kappa, sample_frac=sample_frac))
+					
+					self.decorr_layers.append(getattr(module, name))
+
+				if name == "conv1d":
+					self.n_decorr_layers += 1 				
+					setattr(module, name, DecorrConv1d.from_existing_layer(
+						original_layer=child, compute_loss=compute_loss,
+						kappa=kappa, sample_frac=sample_frac))
+					self.decorr_layers.append(getattr(module, name))
+
+		self.apply(_create_decorr_matrices)
+
+		self.mean_corr_loss = None
+		self.mean_whit_loss = None
+		self.decorr_lr = decorr_lr
+
+		# These are here for reference only, these have been passed to 
+		# the decorrelation modules and they work inside there. 
+		self.kappa = kappa
+		self.sample_frac = sample_frac
+		self.compute_loss = compute_loss
+
+		def _modify_mamba_block_functions(module):
+			for _, child in module.named_children():
+				if type(child) is Mamba:
+					child.forward = self._mamba_block_forward.__get__(child)
+					child.step = self._mamba_block_step.__get__(child)	
+
+		self.apply(_modify_mamba_block_functions)
+
+	def forward(self, x):
+		# fuse decorrelation + main model parameters, then let forward
+		# pass proceed as normal
+		if self.training:
+			self.fuse_decorr()
+
+		# down sample and keep residuals
+		x = self.embedding(x) 
+		residuals = []
+		for dp, blocks in zip(self.down_pooling, 
+			self.mamba_stages_down[:-1]):
+			residuals.append(x)
+			x = blocks(x)
+			# inputs are captured by Mamba blocks separately
+			if isinstance(dp.down_pool, DecorrLinear):
+				dp.capture_inputs = True
+			x = dp(x)
+
+		residuals.append(x)
+
+		# get through the bend in the U
+		x = self.mamba_stages_down[-1](x)
+		x = x + residuals.pop()
+
+		# up-sampling!
+		for up, blocks in zip(
+			reversed(self.up_pooling), reversed(self.mamba_stages_up)):
+			if isinstance(up.up_pool, DecorrLinear):
+				up.capture_inputs = True
+			u = up(x)
+			x = u + residuals.pop()
+			x = blocks(x)
+	
+		lm_logits = self.lm_head(x)
+		CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
+		return CausalLMOutput(logits=lm_logits)
+
+
+class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
+	""" Decorrelated version of SaShiMiMamba."""
+	def __init__(self, existing_model: SaShiMiMamba = None, copy: bool = False, 
+			  kappa: float = 0.5, sample_frac: float = 0.1, decorr_lr: float = None,
+			  compute_loss: bool = True, **factory_kwargs):
+		
+		if existing_model and copy:
+			self.__dict__.update(deepcopy(existing_model).__dict__)
+
+			if factory_kwargs.get("config") is not None:
+				print(
+					"Warning: supplied config overwritten by the config of the existing model")
+		elif existing_model:
+			self.__dict__.update(existing_model.__dict__)
+			if factory_kwargs.get("config") is not None:
+				print(
+					"Warning: supplied config overwritten by the config of the existing model")			
+		else:
+			SaShiMiMamba.__init__(self, **factory_kwargs)
+
+
+		self.n_decorr_layers = 0 # used for averaging the decorr losses later
+		# used for referencing decorrelation layers directly without looping
+		# over complete model structure
+		self.decorr_layers = []
+
+		def _create_decorr_matrices(module):
+			""" 
+			Used to recursively traverse model and create decorrelation matrices 
+			in pre-defined places
+
+			Args:
+				module (nn.Module): model layers to add decorrelation into 
+			"""
+			if self.config.ssm_cfg["layer"] == "Mamba2":
+				decorr_linear_names = ["in_proj", "out_proj", "up_pool", "down_pool"]
+			else:
+				decorr_linear_names = ["in_proj", "out_proj", "x_proj", "up_pool", "down_pool"]
 
 			for name, child in module.named_children():
 				if name in decorr_linear_names:
