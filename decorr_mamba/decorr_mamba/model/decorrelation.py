@@ -7,19 +7,26 @@ from functools import partial
 from copy import deepcopy
 import torch.nn.functional as F
 from torch.nn.functional import linear, conv1d
+
 from mamba_ssm.modules.mamba_simple import Mamba
+from mamba_ssm.modules.mamba2 import Mamba2
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
+from mamba_ssm.distributed.distributed_utils import all_reduce, reduce_scatter
+
 from mamba_ssm.utils.torch import custom_fwd, custom_bwd
 import math
 from decorr_mamba.model.sashimi_mamba import SaShiMiMamba
+from decorr_mamba.model.decorrelation_functions import decorr_mamba_split_conv1d_scan_combined, decorr_mamba_inner_fn
 from collections import namedtuple
 
-import selective_scan_cuda
 
 try:
 	from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+	from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
 	import causal_conv1d_cuda
 except ImportError:
-	causal_conv1d_fn, causal_conv1d_update, causal_conv1d_cuda = None, None, None
+	causal_conv1d_fn, causal_conv1d_update, causal_conv1d_cuda, causal_conv1d_varlen_states = None, None, None, None
 
 try:
 	from mamba_ssm.ops.triton.selective_state_update import selective_state_update
@@ -410,131 +417,6 @@ class DecorrConv1d(DecorrMixin, nn.Conv1d):
 			self.corr_loss = corr_loss
 			self.whit_loss = whit_loss	
 
-class DecorrMambaInnerFn(MambaInnerFn):
-
-	@staticmethod
-	@custom_fwd
-	def forward(ctx, xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
-				out_proj_weight, out_proj_bias,
-				A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
-				C_proj_bias=None, delta_softplus=True, checkpoint_lvl=1, b_rms_weight=None, 
-				c_rms_weight= None, dt_rms_weight= None, b_c_dt_rms_eps=1e-6):
-		"""
-			 xz: (batch, dim, seqlen)
-		"""
-		assert causal_conv1d_cuda is not None, \
-			"causal_conv1d_cuda is not available. Please install causal-conv1d."
-		assert checkpoint_lvl in [0, 1]
-		L = xz.shape[-1]
-		delta_rank = delta_proj_weight.shape[1]
-		d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
-		if torch.is_autocast_enabled():
-			x_proj_weight = x_proj_weight.to(dtype=torch.get_autocast_gpu_dtype())
-			delta_proj_weight = delta_proj_weight.to(dtype=torch.get_autocast_gpu_dtype())
-			out_proj_weight = out_proj_weight.to(dtype=torch.get_autocast_gpu_dtype())
-			out_proj_bias = (out_proj_bias.to(dtype=torch.get_autocast_gpu_dtype())
-							 if out_proj_bias is not None else None)
-		if xz.stride(-1) != 1:
-			xz = xz.contiguous()
-		conv1d_weight = rearrange(conv1d_weight, "d 1 w -> d w")
-		x, z = xz.chunk(2, dim=1)
-		conv1d_bias = conv1d_bias.contiguous() if conv1d_bias is not None else None
-
-		conv1d_inputs = x.detach()
-
-		conv1d_out = causal_conv1d_cuda.causal_conv1d_fwd(
-			x, conv1d_weight, conv1d_bias, None, None, None, True
-		)
-		# We're being very careful here about the layout, to avoid extra transposes.
-		# We want delta to have d as the slowest moving dimension
-		# and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
-		x_proj_inputs = rearrange(conv1d_out.detach(), 'b d l -> b l d')
-
-		x_dbl = F.linear(rearrange(conv1d_out, 'b d l -> (b l) d'), x_proj_weight)  # (bl d)
-		delta = rearrange(delta_proj_weight @ x_dbl[:, :delta_rank].t(), "d (b l) -> b d l", l = L)
-		ctx.is_variable_B = B is None
-		ctx.is_variable_C = C is None
-		ctx.B_proj_bias_is_None = B_proj_bias is None
-		ctx.C_proj_bias_is_None = C_proj_bias is None
-		if B is None:  # variable B
-			B = x_dbl[:, delta_rank:delta_rank + d_state]  # (bl dstate)
-			if B_proj_bias is not None:
-				B = B + B_proj_bias.to(dtype=B.dtype)
-			if not A.is_complex():
-				# B = rearrange(B, "(b l) dstate -> b dstate l", l=L).contiguous()
-				B = rearrange(B, "(b l) dstate -> b 1 dstate l", l=L).contiguous()
-			else:
-				B = rearrange(B, "(b l) (dstate two) -> b 1 dstate (l two)", l=L, two=2).contiguous()
-		else:
-			if B.stride(-1) != 1:
-				B = B.contiguous()
-		if C is None:  # variable C
-			C = x_dbl[:, -d_state:]  # (bl dstate)
-			if C_proj_bias is not None:
-				C = C + C_proj_bias.to(dtype=C.dtype)
-			if not A.is_complex():
-				# C = rearrange(C, "(b l) dstate -> b dstate l", l=L).contiguous()
-				C = rearrange(C, "(b l) dstate -> b 1 dstate l", l=L).contiguous()
-			else:
-				C = rearrange(C, "(b l) (dstate two) -> b 1 dstate (l two)", l=L, two=2).contiguous()
-		else:
-			if C.stride(-1) != 1:
-				C = C.contiguous()
-		if D is not None:
-			D = D.contiguous()
-			
-		if b_rms_weight is not None:
-			B = rearrange(B, "b 1 dstate l -> (b l) dstate", l=L).contiguous()
-			B = rms_norm_forward(B, b_rms_weight, bias=None, eps=b_c_dt_rms_eps)
-			B = rearrange(B, "(b l) dstate -> b 1 dstate l", l=L).contiguous()
-		if c_rms_weight is not None:
-			C = rearrange(C, "b 1 dstate l -> (b l) dstate", l=L).contiguous()
-			C = rms_norm_forward(C, c_rms_weight, bias=None, eps=b_c_dt_rms_eps)
-			C = rearrange(C, "(b l) dstate -> b 1 dstate l", l=L).contiguous()
-		if dt_rms_weight is not None:
-			delta = rearrange(delta, "b d l -> (b l) d", l=L).contiguous()
-			delta = rms_norm_forward(delta, dt_rms_weight, bias=None, eps=b_c_dt_rms_eps)
-			delta = rearrange(delta, "(b l) d -> b d l", l=L).contiguous()
-		
-		out, scan_intermediates, out_z = selective_scan_cuda.fwd(
-			conv1d_out, delta, A, B, C, D, z, delta_bias, delta_softplus
-		)
-		ctx.delta_softplus = delta_softplus
-		ctx.out_proj_bias_is_None = out_proj_bias is None
-		ctx.checkpoint_lvl = checkpoint_lvl
-		ctx.b_rms_weight = b_rms_weight
-		ctx.c_rms_weight = c_rms_weight
-		ctx.dt_rms_weight = dt_rms_weight
-		ctx.b_c_dt_rms_eps = b_c_dt_rms_eps
-		if checkpoint_lvl >= 1:  # Will recompute conv1d_out and delta in the backward pass
-			conv1d_out, delta = None, None
-		ctx.save_for_backward(xz, conv1d_weight, conv1d_bias, x_dbl, x_proj_weight,
-							  delta_proj_weight, out_proj_weight, conv1d_out, delta,
-							  A, B, C, D, delta_bias, scan_intermediates, b_rms_weight, c_rms_weight, dt_rms_weight, out)
-		out_proj_inputs = rearrange(out_z, "b d l -> b l d")
-
-		return F.linear(out_proj_inputs, out_proj_weight, out_proj_bias), \
-			{"conv1d": conv1d_inputs, "x_proj": x_proj_inputs,
-			"out_proj": out_proj_inputs.detach()}
-	
-	@staticmethod
-	def backward(ctx, dout, layer_inputs):
-		grad_input = super(DecorrMambaInnerFn, DecorrMambaInnerFn).backward(ctx, dout)
-		return grad_input
-	
-def decorr_mamba_inner_fn(
-	xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
-	out_proj_weight, out_proj_bias,
-	A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
-	C_proj_bias=None, delta_softplus=True, checkpoint_lvl=1, b_rms_weight= None, c_rms_weight= None, dt_rms_weight= None, b_c_dt_rms_eps=1e-6
-):
-	return DecorrMambaInnerFn.apply(xz, conv1d_weight, conv1d_bias, x_proj_weight, 
-						delta_proj_weight,
-							out_proj_weight, out_proj_bias,
-							A, B, C, D, delta_bias, B_proj_bias, C_proj_bias, 
-							delta_softplus, checkpoint_lvl, b_rms_weight, 
-							c_rms_weight, dt_rms_weight, b_c_dt_rms_eps)
-
 
 
 class DecorrMamba(MambaLMHeadModel):
@@ -584,6 +466,11 @@ class DecorrMamba(MambaLMHeadModel):
 			"""
 
 			for name, child in module.named_children():
+				# works for Mamba2 blocks as well! In those cases there's no
+				# parameter named x_proj so it's just skipped. NB: this is NOT
+				# designed for Mamba2 with tensor parallelism, that would 
+				# require implementation of new decorrelation classes for the
+				# input and output projections. 
 				if name == "in_proj" or name == "out_proj" or name == "x_proj":
 					self.n_decorr_layers += 1
 					setattr(module, name, DecorrLinear.from_existing_layer(
@@ -616,6 +503,10 @@ class DecorrMamba(MambaLMHeadModel):
 				if type(child) is Mamba:
 					child.forward = self._mamba_block_forward.__get__(child)
 					child.step = self._mamba_block_step.__get__(child)	
+				elif type(child) is Mamba2:
+					print("making mamba2 functions")
+					child.forward = self._mamba2_block_forward.__get__(child)
+					child.step = self._mamba2_block_step.__get__(child)						
 
 		self.apply(_modify_mamba_block_functions)
 
@@ -782,6 +673,216 @@ class DecorrMamba(MambaLMHeadModel):
 		out = self.out_proj(y)
 		return out.unsqueeze(1), conv_state, ssm_state
 
+	def _mamba2_block_forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None):
+		"""
+		u: (batch, seqlen, hidden_dim) if seqlen=None.
+			If seqlen is not None, u is (batch * seqlen, hidden_dim). This is so that when we
+			split u during sequence parallel, we split the batch * seqlen dimension
+			(in case batch is small).
+		Returns: same shape as u
+		"""
+		seqlen_og = seqlen
+		if seqlen is None:
+			batch, seqlen, dim = u.shape
+		else:
+			batch_seqlen, dim = u.shape
+			batch = batch_seqlen // seqlen
+
+		conv_state, ssm_state = None, None
+		if inference_params is not None:
+			inference_batch = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else batch
+			conv_state, ssm_state = self._get_states_from_cache(inference_params, inference_batch)
+			if inference_params.seqlen_offset > 0:
+				# The states are updated inplace
+				out, _, _ = self.step(u, conv_state, ssm_state)
+				return out
+			
+		self.in_proj.inputs = u.detach()
+		zxbcdt = self.in_proj(u)  # (B, L, d_in_proj) or (B * L, d_in_proj)
+		if seqlen_og is not None:
+			zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
+		# If the model is loaded in fp16, without the .float() here, A might be -inf
+		A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
+		dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
+		if self.use_mem_eff_path and inference_params is None:
+			out, layer_inputs = decorr_mamba_split_conv1d_scan_combined(
+				zxbcdt,
+				rearrange(self.conv1d.fused_weight, "d 1 w -> d w"),
+				self.conv1d.bias,
+				self.dt_bias,
+				A,
+				D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
+				chunk_size=self.chunk_size,
+				seq_idx=seq_idx,
+				activation=self.activation,
+				rmsnorm_weight=self.norm.weight if self.rmsnorm else None,
+				rmsnorm_eps=self.norm.eps if self.rmsnorm else 1e-6,
+				outproj_weight=self.out_proj.fused_weight,
+				outproj_bias=self.out_proj.bias,
+				headdim=None if self.D_has_hdim else self.headdim,
+				ngroups=self.ngroups,
+				norm_before_gate=self.norm_before_gate,
+				**dt_limit_kwargs,
+			)
+
+			self.conv1d.inputs = layer_inputs["conv1d"]
+			self.out_proj.inputs = layer_inputs["out_proj"]
+
+			if seqlen_og is not None:
+				out = rearrange(out, "b l d -> (b l) d")
+			if self.process_group is not None:
+				reduce_fn = reduce_scatter if self.sequence_parallel else all_reduce
+				out = reduce_fn(out, self.process_group)
+		else:
+			d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
+			z0, x0, z, xBC, dt = torch.split(
+				zxbcdt,
+				[d_mlp, d_mlp, self.d_ssm, self.d_ssm + 2 * self.ngroups * self.d_state, self.nheads],
+				dim=-1
+			)
+			if conv_state is not None:
+				if cu_seqlens is None:
+					# If we just take xBC[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+					# Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+					xBC_t = rearrange(xBC, "b l d -> b d l")
+					conv_state.copy_(F.pad(xBC_t, (self.d_conv - xBC_t.shape[-1], 0)))  # Update state (B D W)
+				else:
+					assert causal_conv1d_varlen_states is not None, "varlen inference requires causal_conv1d package"
+					assert batch == 1, "varlen inference only supports batch dimension 1"
+					conv_varlen_states = causal_conv1d_varlen_states(
+						xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
+					)
+					conv_state.copy_(conv_varlen_states)
+			assert self.activation in ["silu", "swish"]
+
+			self.conv1d.inputs = xBC.detach().transpose(1,2)
+
+			if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
+				assert seq_idx is None, "varlen conv1d requires the causal_conv1d package"
+				xBC = self.act(
+					self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :-(self.d_conv - 1)]
+				)  # (B, L, self.d_ssm + 2 * ngroups * d_state)
+			else:
+				xBC = causal_conv1d_fn(
+					xBC.transpose(1, 2),
+					rearrange(self.conv1d.fused_weight, "d 1 w -> d w"),
+					bias=self.conv1d.bias,
+					activation=self.activation,
+					seq_idx=seq_idx,
+				).transpose(1, 2)
+			x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+			y = mamba_chunk_scan_combined(
+				rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
+				dt,
+				A,
+				rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
+				rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
+				chunk_size=self.chunk_size,
+				D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
+				z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
+				dt_bias=self.dt_bias,
+				dt_softplus=True,
+				seq_idx=seq_idx,
+				cu_seqlens=cu_seqlens,
+				**dt_limit_kwargs,
+				return_final_states=ssm_state is not None,
+				return_varlen_states=cu_seqlens is not None and inference_params is not None,
+			)
+			if ssm_state is not None:
+				y, last_state, *rest = y
+				if cu_seqlens is None:
+					ssm_state.copy_(last_state)
+				else:
+					varlen_states = rest[0]
+					ssm_state.copy_(varlen_states)
+			y = rearrange(y, "b l h p -> b l (h p)")
+			if self.rmsnorm:
+				y = self.norm(y, z)
+			if d_mlp > 0:
+				y = torch.cat([F.silu(z0) * x0, y], dim=-1)
+			if seqlen_og is not None:
+				y = rearrange(y, "b l d -> (b l) d")
+
+			self.out_proj.inputs = y.detach()
+			
+			out = self.out_proj(y)
+		return out
+
+	def _mamba2_block_step(self, hidden_states, conv_state, ssm_state):
+		dtype = hidden_states.dtype
+		assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
+
+		self.in_proj.inputs = hidden_states.detach().squeeze(1)
+
+		zxbcdt = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
+		d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
+		z0, x0, z, xBC, dt = torch.split(
+			zxbcdt,
+			[d_mlp, d_mlp, self.d_ssm, self.d_ssm + 2 * self.ngroups * self.d_state, self.nheads],
+			dim=-1
+		)
+
+		self.conv1d.inputs = xBC.detach()
+
+		# Conv step
+		if causal_conv1d_update is None:
+			conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
+			conv_state[:, :, -1] = xBC
+			xBC = torch.sum(conv_state * rearrange(self.conv1d.fused_weight, "d 1 w -> d w"), dim=-1)  # (B D)
+			if self.conv1d.bias is not None:
+				xBC = xBC + self.conv1d.bias
+			xBC = self.act(xBC).to(dtype=dtype)
+		else:
+			xBC = causal_conv1d_update(
+				xBC,
+				conv_state,
+				rearrange(self.conv1d.fused_weight, "d 1 w -> d w"),
+				self.conv1d.bias,
+				self.activation,
+			)
+
+		x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+		A = -torch.exp(self.A_log.float())  # (nheads,)
+
+		# SSM step
+		if selective_state_update is None:
+			assert self.ngroups == 1, "Only support ngroups=1 for this inference code path"
+			# Discretize A and B
+			dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
+			dA = torch.exp(dt * A)  # (batch, nheads)
+			x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+			dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
+			ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+			y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
+			y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
+			y = rearrange(y, "b h p -> b (h p)")
+			if not self.rmsnorm:
+				y = y * self.act(z)  # (B D)
+		else:
+			A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
+			dt = repeat(dt, "b h -> b h p", p=self.headdim)
+			dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
+			D = repeat(self.D, "h -> h p", p=self.headdim)
+			B = rearrange(B, "b (g n) -> b g n", g=self.ngroups)
+			C = rearrange(C, "b (g n) -> b g n", g=self.ngroups)
+			x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+			if not self.rmsnorm:
+				z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
+			y = selective_state_update(
+				ssm_state, x_reshaped, dt, A, B, C, D, z=z if not self.rmsnorm else None,
+				dt_bias=dt_bias, dt_softplus=True
+			)
+			y = rearrange(y, "b h p -> b (h p)")
+		if self.rmsnorm:
+			y = self.norm(y, z)
+		if d_mlp > 0:
+			y = torch.cat([F.silu(z0) * x0, y], dim=-1)
+
+		self.out_proj.inputs = y.detach()
+
+		out = self.out_proj(y)
+		return out.unsqueeze(1), conv_state, ssm_state
+
 	def forward(self, x):
 		# fuse decorrelation + main model parameters, then let forward
 		# pass proceed as normal
@@ -872,115 +973,6 @@ class DecorrMamba(MambaLMHeadModel):
 		self.compute_loss = compute_loss
 		self.apply_to_decorr(
 			lambda x: setattr(x, 'compute_loss', compute_loss))
-
-
-class DecorrMamba2(DecorrMamba):
-	""" Decorrelated version of Mamba2."""
-	def __init__(self, existing_model: MambaLMHeadModel = None, copy: bool = False, 
-			  kappa: float = 0.5, sample_frac: float = 0.1, decorr_lr: float = None,
-			  compute_loss: bool = True, **factory_kwargs):
-		
-		if existing_model and copy:
-			self.__dict__.update(deepcopy(existing_model).__dict__)
-			if factory_kwargs.get("config") is not None:
-				print(
-					"Warning: supplied config overwritten by the config of the existing model")
-				
-		elif existing_model:
-			self.__dict__.update(existing_model.__dict__)
-			if factory_kwargs.get("config") is not None:
-				print(
-					"Warning: supplied config overwritten by the config of the existing model")			
-		else:
-			MambaLMHeadModel.__init__(self, **factory_kwargs)
-
-		self.n_decorr_layers = 0 # used for averaging the decorr losses later
-		# used for referencing decorrelation layers directly without looping
-		# over complete model structure
-		self.decorr_layers = []
-
-		def _create_decorr_matrices(module):
-			""" 
-			Used to recursively traverse model and create decorrelation matrices 
-			in pre-defined places
-
-			Args:
-				module (nn.Module): model layers to add decorrelation into 
-			"""
-			decorr_linear_names = ["in_proj", "out_proj", "x_proj", "up_pool", "down_pool"]
-
-			for name, child in module.named_children():
-				if name in decorr_linear_names:
-					self.n_decorr_layers += 1
-					setattr(module, name, DecorrLinear.from_existing_layer(
-						original_layer=child, compute_loss=compute_loss, 
-						kappa=kappa, sample_frac=sample_frac))
-					
-					self.decorr_layers.append(getattr(module, name))
-
-				if name == "conv1d":
-					self.n_decorr_layers += 1 				
-					setattr(module, name, DecorrConv1d.from_existing_layer(
-						original_layer=child, compute_loss=compute_loss,
-						kappa=kappa, sample_frac=sample_frac))
-					self.decorr_layers.append(getattr(module, name))
-
-		self.apply(_create_decorr_matrices)
-
-		self.mean_corr_loss = None
-		self.mean_whit_loss = None
-		self.decorr_lr = decorr_lr
-
-		# These are here for reference only, these have been passed to 
-		# the decorrelation modules and they work inside there. 
-		self.kappa = kappa
-		self.sample_frac = sample_frac
-		self.compute_loss = compute_loss
-
-		def _modify_mamba_block_functions(module):
-			for _, child in module.named_children():
-				if type(child) is Mamba:
-					child.forward = self._mamba_block_forward.__get__(child)
-					child.step = self._mamba_block_step.__get__(child)	
-
-		self.apply(_modify_mamba_block_functions)
-
-	def forward(self, x):
-		# fuse decorrelation + main model parameters, then let forward
-		# pass proceed as normal
-		if self.training:
-			self.fuse_decorr()
-
-		# down sample and keep residuals
-		x = self.embedding(x) 
-		residuals = []
-		for dp, blocks in zip(self.down_pooling, 
-			self.mamba_stages_down[:-1]):
-			residuals.append(x)
-			x = blocks(x)
-			# inputs are captured by Mamba blocks separately
-			if isinstance(dp.down_pool, DecorrLinear):
-				dp.capture_inputs = True
-			x = dp(x)
-
-		residuals.append(x)
-
-		# get through the bend in the U
-		x = self.mamba_stages_down[-1](x)
-		x = x + residuals.pop()
-
-		# up-sampling!
-		for up, blocks in zip(
-			reversed(self.up_pooling), reversed(self.mamba_stages_up)):
-			if isinstance(up.up_pool, DecorrLinear):
-				up.capture_inputs = True
-			u = up(x)
-			x = u + residuals.pop()
-			x = blocks(x)
-	
-		lm_logits = self.lm_head(x)
-		CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
-		return CausalLMOutput(logits=lm_logits)
 
 
 class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
