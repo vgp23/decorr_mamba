@@ -152,7 +152,7 @@ class DecorrMambaSplitConv1dScanCombinedFn(MambaSplitConv1dScanCombinedFn):
 		ctx.ngroups = ngroups
 
 		layer_inputs = {"conv1d": conv1d_inputs, "out_proj": out_proj_inputs}
-		return out, layer_inputs if not return_final_states else (out, final_states), layer_inputs
+		return ((out, None), layer_inputs) if not return_final_states else ((out, final_states), layer_inputs)
 
 	@staticmethod
 	@custom_bwd
