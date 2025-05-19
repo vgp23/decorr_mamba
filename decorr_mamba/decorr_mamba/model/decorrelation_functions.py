@@ -156,9 +156,8 @@ class DecorrMambaSplitConv1dScanCombinedFn(MambaSplitConv1dScanCombinedFn):
 
 	@staticmethod
 	@custom_bwd
-	# FIX THIS
 	def backward(ctx, dout, *args):
-		grad_input = super(MambaSplitConv1dScanCombinedFn, MambaSplitConv1dScanCombinedFn).backward(ctx, dout[1], *args)
+		grad_input = super(MambaSplitConv1dScanCombinedFn, MambaSplitConv1dScanCombinedFn).backward(ctx, dout, *args)
 		return grad_input        
 
 class DecorrMambaInnerFn(MambaInnerFn):
