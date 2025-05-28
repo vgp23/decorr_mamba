@@ -704,7 +704,7 @@ class DecorrMamba(MambaLMHeadModel):
 		A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
 		dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
 		if self.use_mem_eff_path and inference_params is None:
-			out = decorr_mamba_split_conv1d_scan_combined(
+			out, layer_inputs = decorr_mamba_split_conv1d_scan_combined(
 				zxbcdt,
 				rearrange(self.conv1d.fused_weight, "d 1 w -> d w"),
 				self.conv1d.bias,
@@ -723,8 +723,6 @@ class DecorrMamba(MambaLMHeadModel):
 				norm_before_gate=self.norm_before_gate,
 				**dt_limit_kwargs,
 			)
-
-			(out, _), layer_inputs = out
 
 			self.conv1d.inputs = layer_inputs["conv1d"]
 			self.out_proj.inputs = layer_inputs["out_proj"]
@@ -1048,6 +1046,9 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 				if type(child) is Mamba:
 					child.forward = self._mamba_block_forward.__get__(child)
 					child.step = self._mamba_block_step.__get__(child)	
+				elif type(child) is Mamba2:
+					child.forward = self._mamba2_block_forward.__get__(child)
+					child.step = self._mamba2_block_step.__get__(child)						
 
 		self.apply(_modify_mamba_block_functions)
 

@@ -157,7 +157,7 @@ class SaShiMiMamba(nn.Module):
 	""" A simple implementation of SaShiMi with a Mamba backbone instead of
 	the default S4 blocks"""
 	def __init__(self, p:int, q:int, depth: int, config: MambaConfig, 
-			  blocks_per_stage:int=5, device=None, dtype=None, 
+			  blocks_per_stage:int=3, device=None, dtype=None, 
 			  initializer_cfg=None):
 			
 		super().__init__()

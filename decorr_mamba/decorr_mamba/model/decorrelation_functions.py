@@ -45,6 +45,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 # layers, which requires re-writing some of the default Mamba functions. To
 # avoid clutter in the main decorrelation.py, we'll do these here. 
 
+# @torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)
 def decorr_mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True):
 	"""
 	Argument:
@@ -66,7 +67,7 @@ def decorr_mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, 
 	"""
 	return DecorrMambaSplitConv1dScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate)
 
-class DecorrMambaSplitConv1dScanCombinedFn(MambaSplitConv1dScanCombinedFn):
+class DecorrMambaSplitConv1dScanCombinedFn(torch.autograd.Function):
 
 	@staticmethod
 	@custom_fwd
@@ -140,6 +141,7 @@ class DecorrMambaSplitConv1dScanCombinedFn(MambaSplitConv1dScanCombinedFn):
 		else:
 			assert outproj_bias is None
 			out_proj_inputs = None
+
 		ctx.save_for_backward(zxbcdt, conv1d_weight, conv1d_bias,
 							  out_x, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias)
 		ctx.dt_limit = dt_limit
@@ -150,15 +152,30 @@ class DecorrMambaSplitConv1dScanCombinedFn(MambaSplitConv1dScanCombinedFn):
 		ctx.chunk_size = chunk_size
 		ctx.headdim = headdim
 		ctx.ngroups = ngroups
-
 		layer_inputs = {"conv1d": conv1d_inputs, "out_proj": out_proj_inputs}
-		return ((out, None), layer_inputs) if not return_final_states else ((out, final_states), layer_inputs)
+		return (out, layer_inputs) if not return_final_states else (out, final_states, layer_inputs)
 
 	@staticmethod
 	@custom_bwd
 	def backward(ctx, dout, *args):
-		grad_input = super(MambaSplitConv1dScanCombinedFn, MambaSplitConv1dScanCombinedFn).backward(ctx, dout, *args)
-		return grad_input        
+		# by default, "args" is a single element containing the final states.
+		# Here, it's either the layer inputs alone (for computing decorrelation
+		# updates), or the layer inputs and the final states. We don't want 
+		# to do anything for the final states, so we'll skip passing them to
+		# the backward function. 
+		if len(args) == 2:
+			args = args[0]
+		elif len(args) > 2:
+			raise NotImplementedError("More args received than expected, don't know how to handle")
+		# If we've only got one element, that's just the inputs, so ignore everything.
+		else:
+			args = () 
+	
+		grad_input = MambaSplitConv1dScanCombinedFn.backward(ctx, dout, *args)
+
+		# Adding the extra None to account for the lack of gradients w.r.t the
+		# saved layer inputs
+		return grad_input + (None,)   
 
 class DecorrMambaInnerFn(MambaInnerFn):
 
