@@ -22,8 +22,10 @@ class TrainingArgs():
 	L: int  
 	B: int 
 	lr: float
-	adam_beta: tuple 
-	adam_epsilon: float
+
+	# optimizer parameters, Adam-based
+	beta: tuple 
+	epsilon: float
 
 	gradient_clip: float
 	weight_decay: float
@@ -56,8 +58,8 @@ class TrainingArgs():
 
 	def _lm_learning_schedule(self, step):
 		# a cosine decay with a minimum value, with a linear warm-up
-		if step < self.warmup_steps:
-			return float(step+1) / float(max(1, self.warmup_steps))
+		if step <= self.warmup_steps:
+			return float(step) / float(max(1, self.warmup_steps))
 		else:
 			# calculate amount of decay progress
 			progress = float(step - self.warmup_steps + 1) / \

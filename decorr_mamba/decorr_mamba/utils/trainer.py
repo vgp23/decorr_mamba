@@ -40,6 +40,19 @@ def generate_fixed_exponential_schedule(num_iterations, num_validations, base):
 
     return validation_schedule[1:]
 
+class DecorrLRScheduler():
+	''' 
+	Scheduler for the decorrelation learning rate. Can't directly use the
+	logic of the PyTorch scheduler as it's tied to a particular optimizer.'''
+	def __init__(self, model: None, lr_lambda: None):
+		self.model = model
+		self.init_lr = model.decorr_lr
+		self.lr_lambda = lr_lambda
+
+	def step(self, step):
+		self.model.decorr_lr = self.init_lr * self.lr_lambda(step)
+
+
 class MambaTrainer:
 	''' Trains a Mamba architecture according to a pre-specified configuration
 
@@ -204,34 +217,32 @@ class MambaTrainer:
 					'weight_decay': 0.0}], 
 
 					lr=self.train_args.lr,
-					betas=self.train_args.adam_beta,
-					eps=self.train_args.adam_epsilon)
+					betas=self.train_args.beta,
+					eps=self.train_args.epsilon)
 				
 			elif self.train_args.optimizer == "soap":
 				
 				if self.is_main:
 					print("\nUsing SOAP optimizer!")
 
-				# stick to default values for now
+				optimizer = SOAP(
+					[{'params': self._param_groups['decay'],
+					'weight_decay': self.train_args.weight_decay}, 
+
+					{'params': self._param_groups['no_decay'], 
+					'weight_decay': 0.0}], 
+
+					lr=self.train_args.lr,
+					betas=self.train_args.beta,
+					eps=self.train_args.epsilon)	
 
 				# optimizer = SOAP(
 				# 	[{'params': self._param_groups['decay'],
 				# 	'weight_decay': self.train_args.weight_decay}, 
 
 				# 	{'params': self._param_groups['no_decay'], 
-				# 	'weight_decay': 0.0}], 
-
-				# 	lr=self.train_args.lr,
-				# 	betas=self.train_args.adam_beta,
-				# 	eps=self.train_args.adam_epsilon)	
-
-				optimizer = SOAP(
-					[{'params': self._param_groups['decay'],
-					'weight_decay': self.train_args.weight_decay}, 
-
-					{'params': self._param_groups['no_decay'], 
-					'weight_decay': 0.0}],
-					lr=self.train_args.lr)
+				# 	'weight_decay': 0.0}],
+				# 	lr=self.train_args.lr)
 			else:
 				raise NotImplementedError			
 			
@@ -239,30 +250,37 @@ class MambaTrainer:
 			if self.train_args.optimizer == "adam":
 				optimizer = torch.optim.Adam(self.model.parameters(), 
 											lr=self.train_args.lr, 
-											betas=self.train_args.adam_beta,
-											eps=self.train_args.adam_epsilon) 
+											betas=self.train_args.beta,
+											eps=self.train_args.epsilon) 
 			elif self.train_args.optimizer == "soap":
 				
 				if self.is_main:
 					print("\nUsing SOAP optimizer!")
 
-				# stick to default values for now
+				optimizer = SOAP(self.model.parameters(), 
+					 weight_decay=0.0,
+					lr=self.train_args.lr,
+					betas=self.train_args.beta,
+					eps=self.train_args.epsilon)	
 
-				# optimizer = SOAP(self.model.parameters(), 
-				# 	 weight_decay=0.0,
-				# 	lr=self.train_args.lr,
-				# 	betas=self.train_args.adam_beta,
-				# 	eps=self.train_args.adam_epsilon)	
-
-				optimizer = SOAP(self.model.parameters(), weight_decay=0.0, 
-					 lr=self.train_args.lr)
+				# optimizer = SOAP(self.model.parameters(), weight_decay=0.0, 
+				# 	 lr=self.train_args.lr)
 			else:
 				raise NotImplementedError				   
 
 		if self.train_args.use_lr_sched:
 			scheduler = torch.optim.lr_scheduler.LambdaLR(
 				optimizer, lr_lambda=self.train_args.schedule_fn)
-			# visualize learning rate schedule
+			
+			# create a separate scheduler for the decorrelation learning rate
+			# too!
+			if isinstance(self.get_model(), DecorrMamba):
+				decorr_scheduler = DecorrLRScheduler(
+					model=self.get_model(), lr_lambda=self.train_args.schedule_fn)
+
+			# visualize learning rate schedule for the backprop parameters
+			# NOTE: DOES NOT WORK FOR THE DECORRELATION LR!! 
+
 			self.train_args.show_lr_schedule()
 			plt.savefig(os.path.join('.', "schedule.png"))
 			
@@ -431,8 +449,9 @@ class MambaTrainer:
 				scaler.step(optimizer)
 				scaler.update()
 				if self.train_args.use_lr_sched:
-					# doesn't affect decorrelation lr
 					scheduler.step()
+					if isinstance(self.get_model(), DecorrMamba):
+						decorr_scheduler.step(step)
 			
 			# update the decorrelation matrices AFTER standard backprop, 
 			# else training breaks!
