@@ -1008,7 +1008,7 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 			Args:
 				module (nn.Module): model layers to add decorrelation into 
 			"""
-			if self.config.ssm_cfg["layer"] == "Mamba2":
+			if self.config.ssm_cfg.get("layer") == "Mamba2":
 				decorr_linear_names = ["in_proj", "out_proj", "up_pool", "down_pool"]
 			else:
 				decorr_linear_names = ["in_proj", "out_proj", "x_proj", "up_pool", "down_pool"]

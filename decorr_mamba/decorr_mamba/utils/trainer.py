@@ -170,7 +170,7 @@ class MambaTrainer:
 				self.get_model().mean_whit_loss, op=torch.distributed.ReduceOp.SUM)
 			self.get_model().mean_whit_loss /= world_size	
 
-	def train_sequence_steps(self, train_loader: DataLoader, val_loader: DataLoader, 
+	def train_sequence_steps(self, train_loader: DataLoader, val_loader: DataLoader, test_loader:DataLoader,
 		use_amp: bool, log_freq: int, n_val: int, train_backprop: bool=True, 
 		train_decorr: bool=True, save_checkpoints: bool=True, pad_idx: int = None,
 		skip_init_val: bool=False, datashuffle_seed: int=0, metric="ppl", val_sched_base: int=20):
@@ -578,3 +578,54 @@ class MambaTrainer:
 						wandb.save(os.path.join(save_path, f"step_{step}.pth"))
 				
 				self.model.train()
+
+		# Testing!
+		self.model.eval()
+
+		total_test_ce_loss = 0.0
+		total_test_metric = 0.0
+
+		with torch.no_grad():
+			with torch.amp.autocast(self.device.type, enabled=use_amp):	
+				# fuse decorrelation matrices again, just once.
+				if isinstance(self.get_model(), DecorrMamba):
+					self.get_model().fuse_decorr()
+				
+				for next_batch in maybe_tqdm(test_loader):
+
+					in_seq = next_batch.long().to(self.device, non_blocking=True)
+					pred = self.model(in_seq[:,:-1]).logits
+						
+					target = in_seq[:,1:].contiguous()
+
+					output_dim = pred.shape[-1]
+					loss = criterion(pred.view(-1, output_dim)[:,:self.mamba_args.vocab_size],
+										target.view(-1))
+
+					if self.train_args.ddp:
+						loss = self.sync_tensor(loss)
+							
+					total_test_ce_loss += loss.item()
+
+					if metric == "ppl":
+						total_test_metric += torch.exp(loss).item()
+					elif metric == "bpb":
+						total_test_metric += (loss * torch.log2(
+							torch.tensor(torch.e))).item()			
+
+		total_test_ce_loss /= len(test_loader)
+		total_test_metric /= len(test_loader)
+
+		if self.is_main:
+			print(f"\nTest {metric}: {total_test_metric:.4f}")				
+			print(f"Test CE loss: {total_test_ce_loss:.4f}")
+			wandb.log({
+				"test_ce_loss": total_test_ce_loss,
+				f"test_{metric}": total_test_metric})
+			
+		torch.save({
+			"model_state": self.model.state_dict(),
+			"optimizer_state": optimizer.state_dict(),}, 
+			os.path.join(save_path, f"final.pth")) 
+		
+		wandb.save(os.path.join(save_path, f"final.pth"))
