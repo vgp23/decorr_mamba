@@ -509,11 +509,24 @@ class DecorrMamba(MambaLMHeadModel):
 
 		self.apply(_modify_mamba_block_functions)
 
-	def _mamba_block_forward(self, hidden_states, inference_params=None):
+	def _mamba_block_forward(self, hidden_states, inference_params=None, to_remove=[]):
 		"""
 		hidden_states: (B, L, D)
 		Returns: same shape as hidden_states
 		"""
+
+		# set the function to reference fused weights when decorrelation layers
+		# exist, otherwise the regular weights. This only applies to the 
+		# weights where decorrelation would be active, and is used for the 
+		# ablation study. 
+		in_proj_weight = self.in_proj.fused_weight if not "in_proj" in to_remove else self.in_proj.weight
+		out_proj_weight = self.out_proj.fused_weight if not "out_proj" in to_remove else self.out_proj.weight
+		conv1d_weight = self.conv1d.fused_weight if not "conv1d" in to_remove else self.conv1d.weight
+		x_proj_weight = self.x_proj.fused_weight if not "x_proj" in to_remove else self.x_proj.weight
+
+		if not "in_proj" in to_remove:
+			self.in_proj.inputs = hidden_states.detach()
+
 		batch, seqlen, dim = hidden_states.shape
 
 		conv_state, ssm_state = None, None
@@ -521,15 +534,13 @@ class DecorrMamba(MambaLMHeadModel):
 			conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
 			if inference_params.seqlen_offset > 0:
 				# The states are updated inplace
-				out, _, _ = self.step(hidden_states, conv_state, ssm_state)
+				out, _, _ = self.step(hidden_states, conv_state, ssm_state, to_remove)
 				return out
 
 		# We do matmul and transpose BLH -> HBL at the same time
 
-		self.in_proj.inputs = hidden_states.detach()
-
 		xz = rearrange(
-			self.in_proj.fused_weight @ rearrange(hidden_states, "b l d -> d (b l)"),
+			in_proj_weight @ rearrange(hidden_states, "b l d -> d (b l)"),
 			"d (b l) -> b d l",
 			l=seqlen,
 		)
@@ -546,11 +557,11 @@ class DecorrMamba(MambaLMHeadModel):
 		if self.use_fast_path and causal_conv1d_fn is not None and inference_params is None:  # Doesn't support outputting the states
 			out, layer_inputs = decorr_mamba_inner_fn(
 				xz,
-				self.conv1d.fused_weight,
+				conv1d_weight,
 				self.conv1d.bias,
-				self.x_proj.fused_weight,
+				x_proj_weight,
 				self.dt_proj.weight,
-				self.out_proj.fused_weight,
+				out_proj_weight,
 				self.out_proj.bias,
 				A,
 				None,  # input-dependent B
@@ -559,9 +570,15 @@ class DecorrMamba(MambaLMHeadModel):
 				delta_bias=self.dt_proj.bias.float(),
 				delta_softplus=True,
 			)
-			self.conv1d.inputs = layer_inputs["conv1d"]
-			self.x_proj.inputs = layer_inputs["x_proj"]
-			self.out_proj.inputs = layer_inputs["out_proj"]
+
+			# not clean but more readable than getattr() type stuff
+			if not "conv1d" in to_remove:
+				self.conv1d.inputs = layer_inputs["conv1d"]
+			if not "x_proj" in to_remove:
+				self.x_proj.inputs = layer_inputs["x_proj"]
+			if not "out_proj" in to_remove:
+				self.out_proj.inputs = layer_inputs["out_proj"]
+
 		else: 
 			x, z = xz.chunk(2, dim=1)
 			# Compute short convolution
@@ -570,14 +587,16 @@ class DecorrMamba(MambaLMHeadModel):
 				# Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
 				conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
 
-			self.conv1d.inputs = x.detach()
+			if not "conv1d" in to_remove:
+				self.conv1d.inputs = x.detach()
+				
 			if causal_conv1d_fn is None:
 				x = self.act(self.conv1d(x)[..., :seqlen])
 			else:
 				assert self.activation in ["silu", "swish"]
 				x = causal_conv1d_fn(
 					x=x,
-					weight=rearrange(self.conv1d.fused_weight, "d 1 w -> d w"),
+					weight=rearrange(conv1d_weight, "d 1 w -> d w"),
 					bias=self.conv1d.bias,
 					activation=self.activation,
 				)
@@ -585,7 +604,9 @@ class DecorrMamba(MambaLMHeadModel):
 			# We're careful here about the layout, to avoid extra transposes.
 			# We want dt to have d as the slowest moving dimension
 			# and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
-			self.x_proj.inputs = rearrange(x, "b d l -> b l d").detach()
+			if not "x_proj" in to_remove:
+				self.x_proj.inputs = rearrange(x, "b d l -> b l d").detach()
+			
 			x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (bl d)
 			dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
 			dt = self.dt_proj.weight @ dt.t()
@@ -609,14 +630,22 @@ class DecorrMamba(MambaLMHeadModel):
 				y, last_state = y
 				ssm_state.copy_(last_state)
 			y = rearrange(y, "b d l -> b l d")
-			self.out_proj.inputs = y.detach()
+
+			if not "out_proj" in self.to_remove:
+				self.out_proj.inputs = y.detach()
+
 			out = self.out_proj(y)
 
 		return out
 
-	def _mamba_block_step(self, hidden_states, conv_state, ssm_state):
+	def _mamba_block_step(self, hidden_states, conv_state, ssm_state, to_remove=[]):
+
+		conv1d_weight = self.conv1d.fused_weight if not "conv1d" in to_remove else self.conv1d.weight
+
 		dtype = hidden_states.dtype
 		assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
+
+		# input logging for this one already taken care of in forward function
 		xz = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
 		x, z = xz.chunk(2, dim=-1)  # (B D)
 
@@ -624,21 +653,23 @@ class DecorrMamba(MambaLMHeadModel):
 		if causal_conv1d_update is None:
 			conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
 			conv_state[:, :, -1] = x
+			
+			if not "conv1d" in to_remove:
+				self.conv1d.inputs = conv_state.detach()
 
-			self.conv1d.inputs = conv_state.detach()
-
-			x = torch.sum(conv_state * rearrange(self.conv1d.fused_weight, "d 1 w -> d w"), dim=-1)  # (B D)
+			x = torch.sum(conv_state * rearrange(conv1d_weight, "d 1 w -> d w"), dim=-1)  # (B D)
 			if self.conv1d.bias is not None:
 				x = x + self.conv1d.bias
 			x = self.act(x).to(dtype=dtype)
 		else:
-
-			self.conv1d.inputs = x.detach()
+			
+			if not "conv1d" in to_remove:
+				self.conv1d.inputs = x.detach()
 
 			x = causal_conv1d_update(
 				x,
 				conv_state,
-				rearrange(self.conv1d.fused_weight, "d 1 w -> d w"),
+				rearrange(conv1d_weight, "d 1 w -> d w"),
 				self.conv1d.bias,
 				self.activation,
 			)
@@ -978,7 +1009,7 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 	""" Decorrelated version of SaShiMiMamba."""
 	def __init__(self, existing_model: SaShiMiMamba = None, copy: bool = False, 
 			  kappa: float = 0.5, sample_frac: float = 0.1, decorr_lr: float = None,
-			  compute_loss: bool = True, **factory_kwargs):
+			  compute_loss: bool = True, to_remove: list[str] = None, **factory_kwargs):
 		
 		if existing_model and copy:
 			self.__dict__.update(deepcopy(existing_model).__dict__)
@@ -999,6 +1030,7 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 		# used for referencing decorrelation layers directly without looping
 		# over complete model structure
 		self.decorr_layers = []
+		self.to_remove = to_remove
 
 		def _create_decorr_matrices(module):
 			""" 
@@ -1014,7 +1046,7 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 				decorr_linear_names = ["in_proj", "out_proj", "x_proj", "up_pool", "down_pool"]
 
 			for name, child in module.named_children():
-				if name in decorr_linear_names:
+				if name in decorr_linear_names and not name in self.to_remove:
 					self.n_decorr_layers += 1
 					setattr(module, name, DecorrLinear.from_existing_layer(
 						original_layer=child, compute_loss=compute_loss, 
@@ -1022,7 +1054,7 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 					
 					self.decorr_layers.append(getattr(module, name))
 
-				if name == "conv1d":
+				if name == "conv1d" and not "conv1d" in self.to_remove:
 					self.n_decorr_layers += 1 				
 					setattr(module, name, DecorrConv1d.from_existing_layer(
 						original_layer=child, compute_loss=compute_loss,
@@ -1044,8 +1076,8 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 		def _modify_mamba_block_functions(module):
 			for _, child in module.named_children():
 				if type(child) is Mamba:
-					child.forward = self._mamba_block_forward.__get__(child)
-					child.step = self._mamba_block_step.__get__(child)	
+					child.forward = partial(self._mamba_block_forward.__get__(child), to_remove=to_remove)
+					child.step = partial(self._mamba_block_step.__get__(child), to_remove=to_remove)
 				elif type(child) is Mamba2:
 					child.forward = self._mamba2_block_forward.__get__(child)
 					child.step = self._mamba2_block_step.__get__(child)						
