@@ -1,7 +1,8 @@
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 import math
 import torch  
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm 
 import os
 import json
@@ -15,6 +16,7 @@ from ..data.synthetics import InductionData
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.models.config_mamba import MambaConfig
 from ..utils.SOAP.soap import SOAP
+from typing import Iterator
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -170,7 +172,7 @@ class MambaTrainer:
 				self.get_model().mean_whit_loss, op=torch.distributed.ReduceOp.SUM)
 			self.get_model().mean_whit_loss /= world_size	
 
-	def train_sequence_steps(self, train_loader: DataLoader, val_loader: DataLoader, test_loader:DataLoader,
+	def train_sequence_steps(self, train_loader, val_loader: DataLoader, test_loader:DataLoader,
 		use_amp: bool, log_freq: int, n_val: int, train_backprop: bool=True, 
 		train_decorr: bool=True, save_checkpoints: bool=True, pad_idx: int = None,
 		skip_init_val: bool=False, datashuffle_seed: int=0, metric="ppl", val_sched_base: int=20):
@@ -221,9 +223,6 @@ class MambaTrainer:
 					eps=self.train_args.epsilon)
 				
 			elif self.train_args.optimizer == "soap":
-				
-				if self.is_main:
-					print("\nUsing SOAP optimizer!")
 
 				optimizer = SOAP(
 					[{'params': self._param_groups['decay'],
@@ -252,10 +251,8 @@ class MambaTrainer:
 											lr=self.train_args.lr, 
 											betas=self.train_args.beta,
 											eps=self.train_args.epsilon) 
-			elif self.train_args.optimizer == "soap":
 				
-				if self.is_main:
-					print("\nUsing SOAP optimizer!")
+			elif self.train_args.optimizer == "soap":
 
 				optimizer = SOAP(self.model.parameters(), 
 					 weight_decay=0.0,
@@ -622,6 +619,409 @@ class MambaTrainer:
 			wandb.log({
 				"test_ce_loss": total_test_ce_loss,
 				f"test_{metric}": total_test_metric})
+			
+		torch.save({
+			"model_state": self.model.state_dict(),
+			"optimizer_state": optimizer.state_dict(),}, 
+			os.path.join(save_path, f"final.pth")) 
+		
+		wandb.save(os.path.join(save_path, f"final.pth"))
+
+	def train_synthetic(self, train_dataset: TensorDataset, 
+		val_loaders: dict[DataLoader, str], test_loaders: dict[DataLoader, str],
+		use_amp: bool, log_freq: int, n_val: int, task: str, train_backprop: bool=True, 
+		train_decorr: bool=True, save_checkpoints: bool=True, skip_init_val: bool=False):
+
+		''' 
+		Trains the model with the protocol specified in train_args. Trains based
+		on a fixed number of gradient descent steps, performs validation
+		at pre-defined points within the training loop. 
+
+		'''
+		criterion = nn.CrossEntropyLoss()
+
+		if not train_backprop:
+			print("Warning: not training backpropagation parameters!")
+		if not train_decorr:
+			print("Warning: not training decorrelation parameters!")
+		assert train_backprop or train_decorr, "Specify something to train"
+
+		if not isinstance(self.get_model(), DecorrMamba) and train_decorr:
+			print("Warning: train_decorr set to True but model does not use decorrelation!")
+		
+		if isinstance(self.get_model(), DecorrMamba):
+			if int(self.train_args.B*self.get_model().sample_frac) < 1:
+				print("Warning: decorrelation sub-sampling too small, will use 1 batch instead.\n")
+
+		if self.train_args.weight_decay is not None:
+			if self.train_args.optimizer == "adam":
+				optimizer = torch.optim.AdamW(
+					[{'params': self._param_groups['decay'],
+					'weight_decay': self.train_args.weight_decay}, 
+
+					{'params': self._param_groups['no_decay'], 
+					'weight_decay': 0.0}], 
+
+					lr=self.train_args.lr,
+					betas=self.train_args.beta,
+					eps=self.train_args.epsilon)
+				
+			elif self.train_args.optimizer == "soap":
+
+				optimizer = SOAP(
+					[{'params': self._param_groups['decay'],
+					'weight_decay': self.train_args.weight_decay}, 
+
+					{'params': self._param_groups['no_decay'], 
+					'weight_decay': 0.0}], 
+
+					lr=self.train_args.lr,
+					betas=self.train_args.beta,
+					eps=self.train_args.epsilon)	
+			else:
+				raise NotImplementedError			
+			
+		else:
+			if self.train_args.optimizer == "adam":
+				optimizer = torch.optim.Adam(self.model.parameters(), 
+											lr=self.train_args.lr,
+											betas=self.train_args.beta,
+											eps=self.train_args.epsilon) 
+				
+			elif self.train_args.optimizer == "soap":
+
+				optimizer = SOAP(self.model.parameters(), 
+					 weight_decay=0.0,
+					lr=self.train_args.lr,
+					betas=self.train_args.beta,
+					eps=self.train_args.epsilon)
+			else:
+				raise NotImplementedError				   
+
+		if self.train_args.use_lr_sched:
+			scheduler = torch.optim.lr_scheduler.LambdaLR(
+				optimizer, lr_lambda=self.train_args.schedule_fn)
+			
+			# create a separate scheduler for the decorrelation learning rate
+			# too!
+			if isinstance(self.get_model(), DecorrMamba):
+				decorr_scheduler = DecorrLRScheduler(
+					model=self.get_model(), lr_lambda=self.train_args.schedule_fn)
+
+			# visualize learning rate schedule for the backprop parameters
+			# NOTE: DOES NOT WORK FOR THE DECORRELATION LR!! 
+
+			self.train_args.show_lr_schedule()
+			plt.savefig(os.path.join('.', "schedule.png"))
+			
+		
+		save_path = os.path.join(".", "checkpoints")
+		os.makedirs(save_path, exist_ok=True)
+
+		scaler = torch.amp.GradScaler(self.device.type, enabled=use_amp)
+		val_sched = [i*(self.train_args.n_steps//n_val) for i in range(1,n_val+1)]
+		train_iterator = iter(train_dataset)
+
+		if train_backprop:
+			self.model.train()
+		else:
+			self.model.eval()
+
+
+		for step in tqdm(range(1, self.train_args.n_steps+1)):
+			# initial validation before training
+			if step == 1 and not skip_init_val:
+				self.model.eval()
+				for val_loader, name in val_loaders.items():
+					total_val_ce_loss = 0.0
+					total_val_acc = 0.0
+					total_tokens = 0
+
+					with torch.no_grad():
+						with torch.amp.autocast(self.device.type, enabled=use_amp):	
+
+							if isinstance(self.get_model(), DecorrMamba):
+								self.get_model().fuse_decorr()
+							
+							for next_batch in tqdm(val_loader):
+
+								in_seq, target = next_batch
+								in_seq = in_seq.long().to(self.device, non_blocking=True)
+								target = target.long().to(self.device, non_blocking=True).contiguous()
+
+								if task == "induction":
+									# feed entire sequence including the 
+									# retrieval cue at the very end, and only train 
+									# the output predicted at the final token 
+									pred = self.model(in_seq).logits[:,-1,:]
+								elif task == "selective_copy":
+									# feed entire sequence, and only train the
+									# output predicted for the sequence of however
+									# many data tokens we chose (at the very end)
+									pred_len = target.shape[1]
+									pred = self.model(in_seq).logits[:,-pred_len:,:]
+								else:
+									raise NotImplementedError
+						
+								# collapse across batch dimension, and ignore the
+								# unused output head dimensions
+								output_dim = pred.shape[-1]
+								pred = pred.reshape(-1, output_dim)[:,:self.mamba_args.vocab_size]
+								target = target.view(-1)
+
+								loss = criterion(pred, target)
+										
+								total_val_ce_loss += loss.item()
+
+								# calculate accuracy
+								probs = F.softmax(pred, dim=1)
+								preds = torch.argmax(probs, dim=1)
+								n_correct = torch.sum(preds==target).item()
+								total_val_acc += n_correct
+								total_tokens += target.numel()
+
+
+					total_val_ce_loss /= len(val_loader)
+					total_val_acc = 100*(total_val_acc/total_tokens)
+
+					print(f"Initial val accuracy {name}: {total_val_acc:.2f}%")				
+					print(f"Initial val CE loss {name}: {total_val_ce_loss:.4f}")
+					wandb.log({
+						"val_ce_loss_{name}": total_val_ce_loss,
+						f"val_acc_{name}": total_val_acc}, step=step)
+						
+				self.model.train()	
+
+			# an infinite loop for the fixed number of gradient descent 
+			# steps
+			try:
+				next_batch = next(train_iterator)
+			except StopIteration:
+				train_iterator = iter(train_dataset)  # Reset the iterator
+				next_batch = next(train_iterator)
+
+			in_seq, target = next_batch
+			in_seq = in_seq.long().to(self.device, non_blocking=True)
+			target = target.long().to(self.device, non_blocking=True).contiguous()
+
+			if train_backprop:
+				optimizer.zero_grad()
+			
+			if isinstance(self.get_model(), DecorrMamba):
+				if self.get_model().compute_loss or self.model.training:
+					self.get_model().reset_decorr()
+
+			with torch.amp.autocast(self.device.type, enabled=use_amp):
+				with torch.enable_grad() if train_backprop else torch.no_grad():
+					if task == "induction":
+						# feed entire sequence including the 
+						# retrieval cue at the very end, and only train 
+						# the output predicted at the final token 
+						pred = self.model(in_seq).logits[:,-1,:]
+					elif task == "selective_copy":
+						# feed entire sequence, and only train the
+						# output predicted for the sequence of however
+						# many data tokens we chose (at the very end)
+						pred_len = target.shape[1]
+						pred = self.model(in_seq).logits[:,-pred_len:,:]
+					else:
+						raise NotImplementedError
+
+				# NB: ignore the irrelevant extra dimensions in the output,
+				# those are just there for padding (GPU efficiency). Collapse
+				# across batch and length before feeding to loss.
+				output_dim = pred.shape[-1]
+				pred = pred.reshape(-1, output_dim)[:,:self.mamba_args.vocab_size]
+				target = target.view(-1)
+				loss = criterion(pred, target)	
+			
+			# calculate accuracy on the batch
+			probs = F.softmax(pred, dim=1)
+			preds = torch.argmax(probs, dim=1)
+			batch_acc = 100*(torch.sum(preds==target).item()/target.shape[0])
+
+			if step%log_freq == 0:
+				wandb.log({"train_ce_loss": loss.item(), 
+							f"train_acc": batch_acc}, step=step)					
+			
+			if train_backprop:
+				scaler.scale(loss).backward()
+			
+			# gradient clipping
+			if self.train_args.gradient_clip is not None:
+				scaler.unscale_(optimizer)
+				torch.nn.utils.clip_grad_norm_(self.model.parameters(), 
+											self.train_args.gradient_clip)									
+
+			if train_backprop:
+				scaler.step(optimizer)
+				scaler.update()
+				if self.train_args.use_lr_sched:
+					scheduler.step()
+					if isinstance(self.get_model(), DecorrMamba):
+						decorr_scheduler.step(step)
+			
+			# update the decorrelation matrices AFTER standard backprop, 
+			# else training breaks!
+			if isinstance(self.get_model(), DecorrMamba):
+				if self.get_model().compute_loss or self.model.training:
+					self.get_model().decorr_operations()
+					self.get_model().mean_decorr_losses()
+
+				train_corr_loss = self.get_model().mean_corr_loss
+				train_whit_loss = self.get_model().mean_whit_loss
+
+				if train_corr_loss is not None:
+					train_corr_loss = train_corr_loss.item()
+				if train_whit_loss is not None:
+					train_whit_loss = train_whit_loss.item()
+				
+				if step%log_freq == 0:
+					wandb.log({"train_corr_loss": train_corr_loss, 
+							"train_whit_loss": train_whit_loss}, step=step)	
+					
+				if train_decorr:
+					self.get_model().update_decorr_matrices()
+
+			# Condition checking if validate_every number of gradient descent
+			# steps have happened
+			
+			if step in val_sched:
+
+				# -------------------------------- validation -------------------------------------	
+
+				# Don't want to compute whitening/correlation losses here because
+				# it makes validation extremely slow, if cross entropy is lower 
+				# that's all that really matters for the most part
+				
+				self.model.eval()
+				for val_loader, name in val_loaders.items():
+					total_val_ce_loss = 0.0
+					total_val_acc = 0.0
+					total_tokens = 0
+
+					with torch.no_grad():
+						with torch.amp.autocast(self.device.type, enabled=use_amp):	
+
+							if isinstance(self.get_model(), DecorrMamba):
+								self.get_model().fuse_decorr()
+							
+							for next_batch in tqdm(val_loader):
+
+								in_seq, target = next_batch
+								in_seq = in_seq.long().to(self.device, non_blocking=True)
+								target = target.long().to(self.device, non_blocking=True).contiguous()
+
+								if task == "induction":
+									# feed entire sequence including the 
+									# retrieval cue at the very end, and only train 
+									# the output predicted at the final token 
+									pred = self.model(in_seq).logits[:,-1,:]
+								elif task == "selective_copy":
+									# feed entire sequence, and only train the
+									# output predicted for the sequence of however
+									# many data tokens we chose (at the very end)
+									pred_len = target.shape[1]
+									pred = self.model(in_seq).logits[:,-pred_len:,:]
+								else:
+									raise NotImplementedError
+						
+								# collapse across batch dimension, and ignore the
+								# unused output head dimensions
+								output_dim = pred.shape[-1]
+								pred = pred.reshape(-1, output_dim)[:,:self.mamba_args.vocab_size]
+								target = target.view(-1)
+
+								loss = criterion(pred, target)
+										
+								total_val_ce_loss += loss.item()
+
+								# calculate accuracy
+								probs = F.softmax(pred, dim=1)
+								preds = torch.argmax(probs, dim=1)
+								n_correct = torch.sum(preds==target).item()
+								total_val_acc += n_correct
+								total_tokens += target.numel()
+
+					total_val_ce_loss /= len(val_loader)
+					total_val_acc = 100*(total_val_acc / total_tokens)
+
+					print(f"val accuracy {name}: {total_val_acc:.2f}%")				
+					print(f"val CE loss {name}: {total_val_ce_loss:.4f}")
+					wandb.log({
+						f"val_ce_loss_{name}": total_val_ce_loss,
+						f"val_acc_{name}": total_val_acc}, step=step)
+
+					if save_checkpoints:
+						torch.save({
+							"model_state": self.model.state_dict(),
+							"optimizer_state": optimizer.state_dict(),}, 
+							os.path.join(save_path, f"step_{step}.pth")) 
+						
+						wandb.save(os.path.join(save_path, f"step_{step}.pth"))
+				
+				self.model.train()
+
+		# Testing!
+		self.model.eval()
+		for test_loader, name in test_loaders.items():
+			total_test_ce_loss = 0.0
+			total_test_acc = 0.0
+			total_tokens = 0
+
+			with torch.no_grad():
+				with torch.amp.autocast(self.device.type, enabled=use_amp):	
+
+					if isinstance(self.get_model(), DecorrMamba):
+						self.get_model().fuse_decorr()
+					
+					for next_batch in tqdm(test_loader):
+
+						in_seq, target = next_batch
+						in_seq = in_seq.long().to(self.device, non_blocking=True)
+						target = target.long().to(self.device, non_blocking=True).contiguous()
+
+						if task == "induction":
+							# feed entire sequence including the 
+							# retrieval cue at the very end, and only train 
+							# the output predicted at the final token 
+							pred = self.model(in_seq).logits[:,-1,:]
+						elif task == "selective_copy":
+							# feed entire sequence, and only train the
+							# output predicted for the sequence of however
+							# many data tokens we chose (at the very end)
+							pred_len = target.shape[1]
+							pred = self.model(in_seq).logits[:,-pred_len:,:]
+						else:
+							raise NotImplementedError
+				
+						# collapse across batch dimension, and ignore the
+						# unused output head dimensions
+						output_dim = pred.shape[-1]
+						pred = pred.reshape(-1, output_dim)[:,:self.mamba_args.vocab_size]
+						target = target.view(-1)
+
+						loss = criterion(pred, target)
+								
+						total_test_ce_loss += loss.item()
+
+						# calculate accuracy
+						probs = F.softmax(pred, dim=1)
+						preds = torch.argmax(probs, dim=1)
+
+						n_correct = torch.sum(preds==target).item()
+						total_test_acc += n_correct
+						total_tokens += target.numel()
+
+
+			total_test_ce_loss /= len(test_loader)
+			total_test_acc  = 100*(total_test_acc/total_tokens)
+
+			print(f"test accuracy {name}: {total_test_acc:.2f}%")				
+			print(f"test CE loss {name}: {total_test_ce_loss:.4f}")
+			wandb.log({
+				f"test_ce_loss_{name}": total_test_ce_loss,
+				f"test_acc_{name}": total_test_acc}, step=step)
 			
 		torch.save({
 			"model_state": self.model.state_dict(),
