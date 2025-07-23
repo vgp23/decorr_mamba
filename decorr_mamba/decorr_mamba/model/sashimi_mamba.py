@@ -119,14 +119,36 @@ class DownPool(nn.Module):
 		device = factory_kwargs.get("device")
 		dtype = factory_kwargs.get("dtype")
 		self.down_pool = nn.Linear(p*H, q*H, dtype=dtype, device=device)
-		self.capture_inputs = False # Captures linear layerinputs during decorr training
+
+		# NB: super messy, I don't like this...
+		self.capture_inputs = False # Captures linear layer inputs during decorr training
+		self.demeaning = False # De-means linear layer inputs during decorr training
 
 	def forward(self, x):
 		B, L, _ = x.shape
 		reshaped = x.reshape(B, -1, self.H*self.p)
+
+		# decorrelation operations... There have no business being in here,
+		# but the alternative is a pain to implement and is confusing for
+		# different reasons. 
+
+		# We switch this on if down_pool is a decorrelation layer and we're 
+		# currently training, in the DecorrSaShiMiMamba forward pass. Switch it
+		# off immediately after, so we don't need to worry about it during
+		# inference.
 		if self.capture_inputs:
 			self.down_pool.inputs = reshaped.detach()
 			self.capture_inputs = False
+
+		# same idea as with capture_inputs, but don't switch off after because
+		# we always de-mean!
+		if self.demeaning:
+			if self.training:
+				self.down_pool.batch_mean = torch.mean(reshaped, axis=[0,1])
+				reshaped = reshaped - self.down_pool.batch_mean[None, None, :]
+			else:
+				reshaped = reshaped - self.down_pool.running_mean[None, None, :]
+
 		down_sampled = self.down_pool(reshaped)
 		return down_sampled 
 
@@ -141,12 +163,25 @@ class UpPool(nn.Module):
 		dtype = factory_kwargs.get("dtype")
 		self.up_pool = nn.Linear(H, int(p*H/q), dtype=dtype, device=device)
 		self.capture_inputs = False # Captures linear layer inputs during decorr training
+		self.demeaning = False
 
 	def forward(self, x):
 		B, _, _ = x.shape
+
+		# decorrelation operations... bad practice...
 		if self.capture_inputs:
 			self.up_pool.inputs = x.detach()
 			self.capture_inputs = False
+
+		# same idea as with capture_inputs, but don't switch off after because
+		# we always de-mean!
+		if self.demeaning:
+			if self.training:
+				self.up_pool.batch_mean = torch.mean(x, axis=[0,1])
+				x = x - self.up_pool.batch_mean[None, None, :]
+			else:
+				x = x - self.up_pool.running_mean[None, None, :]
+
 		up_sampled = self.up_pool(x)
 		# shift to maintain causality
 		up_sampled = F.pad(up_sampled[:, :-1, :], (0,0,1,0)) 

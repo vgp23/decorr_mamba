@@ -17,7 +17,7 @@ from mamba_ssm.distributed.distributed_utils import all_reduce, reduce_scatter
 from mamba_ssm.utils.torch import custom_fwd, custom_bwd
 import math
 from decorr_mamba.model.sashimi_mamba import SaShiMiMamba
-from decorr_mamba.model.decorrelation_functions import decorr_mamba_split_conv1d_scan_combined, decorr_mamba_inner_fn
+from decorr_mamba.model.decorrelation_functions import decorr_mamba_inner_fn #decorr_mamba_split_conv1d_scan_combined
 from collections import namedtuple
 
 
@@ -116,56 +116,12 @@ class DecorrLoss(nn.Module):
 				corr_loss = whit_loss = None 
 
 			return grad, corr_loss, whit_loss
-
-# class TrackingTensor:
-# 	""" Wrapper around Tensor, used to capture the tensors which a 
-# 		parameter tensor is multiplied by during the forward pass. Necessary
-# 		because the selective scan algorithm does not use typical forward pass
-# 		logic (forward pass of constituent layers is not necessarily called,
-# 		making it impossible to track layer inputs for decorrelation gradient
-# 		updates)"""
-# 	def __init__(self, tensor, parent_layer):
-# 		if not isinstance(tensor, torch.Tensor):
-# 			raise TypeError("Expected a Tensor")
-# 		self.tensor = tensor
-# 		# set a reference to the decorr layer containing this tensor, for
-# 		# tracking layer inputs
-# 		self.parent_layer = parent_layer
-
-# 	def __matmul__(self, other):
-# 		"""Intercepts matrix multiplication to log the input."""
-# 		self.parent_layer.inputs = other.detach()
-# 		return self.tensor @ other
-
-# 	def __rmatmul__(self, other):
-# 		"""Tracks all tensors that multiplied self: x @ W"""
-# 		self.parent_layer.inputs = other.detach()
-# 		return other @ self.tensor
-		
-# 	def transpose(self, dim0, dim1):
-# 		""" Ensures transposition is also tracked """
-# 		# Make a new tensor, referencing the same parent layer
-# 		transposed_parameter = TrackingTensor(
-# 			self.tensor.transpose(dim0, dim1), self.parent_layer)
-# 		return transposed_parameter
-
-# 	@property
-# 	def T(self):
-# 		""" Handles W.T so it retains tracking """
-# 		return self.transpose(0, 1)	
-
-# 	def __getattr__(self, name):
-# 		# Forward everything else to the underlying tensor
-# 		return getattr(self.tensor, name)
-
-# 	def __repr__(self):
-# 		return f"TrackingTensor({self.tensor})"
 			
 class DecorrMixin:
 	""" Wrapper class providing simple functionality to all decorrelation
 		layers. """
 	def __init__(self, compute_loss: bool, 
-			  kappa: float, sample_frac: float):
+			  kappa: float, sample_frac: float, demeaning: bool = False):
 
 		self.corr_loss = None
 		self.whit_loss = None
@@ -174,6 +130,7 @@ class DecorrMixin:
 		self.compute_loss = compute_loss
 		self.loss_module = DecorrLoss()
 		self.inputs = None
+		self.demeaning = demeaning 
 
 	def reset(self):
 		""" Resets gradients and losses of decorrelation layers, used 
@@ -183,7 +140,7 @@ class DecorrMixin:
 		self.whit_loss = None
 		self.decorr_layer.grad = None
 
-	def update_decorr_matrices(self, decorr_lr: float):
+	def update_decorr_matrix(self, decorr_lr: float):
 		""" Updates decorrelation parameters. 
 		
 		Args:
@@ -213,19 +170,26 @@ class DecorrLinear(DecorrMixin, nn.Linear):
 	"""
 
 	def __init__(self, compute_loss: bool = True,
-				kappa: float = None, sample_frac: float = None,  **factory_kwargs):
+				kappa: float = None, sample_frac: float = None, 
+				demeaning: bool = False, **factory_kwargs):
 		
-		DecorrMixin.__init__(compute_loss, kappa, sample_frac)
+		DecorrMixin.__init__(compute_loss, kappa, sample_frac, demeaning)
 		nn.Linear.__init__(**factory_kwargs)
 
 		self.decorr_layer = nn.Parameter(
 			torch.eye(self.in_features).to(self.weight.device), requires_grad=False)
+
+		if self.demeaning:
+			self.register_buffer("batch_mean", None)
+			self.register_buffer("running_mean", 
+				torch.zeros(self.in_features,
+				device=self.weight.device))
 		
 
 	@classmethod
 	def from_existing_layer(cls, original_layer: nn.Module,
 						 compute_loss: bool = True, kappa: float = None, 
-						 sample_frac: float = None):
+						 sample_frac: float = None, demeaning: bool = False):
 		"""Creates a `DecorrLinear` instance from an existing `nn.Linear` layer.
 
 		Args:
@@ -250,7 +214,7 @@ class DecorrLinear(DecorrMixin, nn.Linear):
 		new_layer.__dict__.update(original_layer.__dict__)
 
 		# initialize DecorrMixin manually
-		DecorrMixin.__init__(new_layer, compute_loss, kappa, sample_frac)
+		DecorrMixin.__init__(new_layer, compute_loss, kappa, sample_frac, demeaning)
 
 		# initialize DecorrLinear-specific attributes
 		new_layer.decorr_layer = nn.Parameter(
@@ -258,9 +222,17 @@ class DecorrLinear(DecorrMixin, nn.Linear):
 			 device=original_layer.weight.device), requires_grad=False
 		)
 
+		if new_layer.demeaning:
+			new_layer.register_buffer("batch_mean", None)
+			new_layer.register_buffer("running_mean", 
+				torch.zeros(new_layer.in_features,
+				device=new_layer.weight.device))
+
 		return new_layer
 
 	def forward(self, x):
+		# all demeaning and saving decorrelation layer inputs happens in the
+		# main forward pass function for Mamba, check that there!
 		return linear(x, self.fused_weight, self.bias)
 
 	def fuse_decorr(self):
@@ -287,10 +259,12 @@ class DecorrLinear(DecorrMixin, nn.Linear):
 			subset = x[torch.randperm(b, device=x.device)[:num_samples]]
 
 			# forward pass this through the decorrelation matrix
-			decorr_out = subset @ self.decorr_layer.T
+			with torch.no_grad():
+				decorr_out = subset @ self.decorr_layer.T
 
 			grad, corr_loss, whit_loss = self.loss_module(
 				decorr_out, self.kappa, self.training, self.compute_loss, batched=False)		
+
 
 			self.decorr_layer.grad = grad
 			self.corr_loss = corr_loss
@@ -298,7 +272,7 @@ class DecorrLinear(DecorrMixin, nn.Linear):
 
 class DecorrConv1d(DecorrMixin, nn.Conv1d):
 	def __init__(self, compute_loss: bool = True, kappa: float = None, 
-			  sample_frac: float = None, **factory_kwargs):
+			  sample_frac: float = None, demeaning: bool=False, **factory_kwargs):
 		"""A 1D convolutional layer with decorrelation applied to its weight matrix.
 
 		Inherits from `nn.Conv1d` and `DecorrMixin` to introduce decorrelation
@@ -314,19 +288,26 @@ class DecorrConv1d(DecorrMixin, nn.Conv1d):
 			**factory_kwargs: Additional arguments for `nn.Conv1d`.
 		"""
 		
-		DecorrMixin.__init__(compute_loss, kappa, sample_frac)
+		DecorrMixin.__init__(compute_loss, kappa, sample_frac, demeaning)
 		nn.Conv1d.__init__(**factory_kwargs)
 
 		# (in_channels, kernel_size, kernel_size)
 		all_matrices = torch.eye(self.kernel_size[0]).unsqueeze(0).repeat(
 					self.in_channels, 1, 1).to(self.weight.device)
-
+		
 		self.decorr_layer = nn.Parameter(all_matrices, requires_grad=False)
+
+		if self.demeaning:
+			self.register_buffer("batch_mean", None)
+			self.register_buffer("running_mean", 
+				torch.zeros(self.in_channels,
+				device=self.weight.device))
+	
 
 	@classmethod
 	def from_existing_layer(cls, original_layer: nn.Module, 
 						 compute_loss: bool = True, kappa: float = None, 
-						 sample_frac: float = None):
+						 sample_frac: float = None, demeaning: bool=False):
 		"""Creates a `DecorrConv1d` instance from an existing `nn.Conv1d` layer.
 
 		Args:
@@ -350,7 +331,7 @@ class DecorrConv1d(DecorrMixin, nn.Conv1d):
 		new_layer.__dict__.update(original_layer.__dict__)
 
 		# initialize DecorrMixin manually
-		DecorrMixin.__init__(new_layer, compute_loss, kappa, sample_frac)
+		DecorrMixin.__init__(new_layer, compute_loss, kappa, sample_frac, demeaning)
 
 		# initialize DecorrConv1d-specific attributes
 		# (in_channels, kernel_size, kernel_size)
@@ -359,9 +340,17 @@ class DecorrConv1d(DecorrMixin, nn.Conv1d):
 
 		new_layer.decorr_layer = nn.Parameter(all_matrices, requires_grad=False)
 
+		if new_layer.demeaning:
+			new_layer.register_buffer("batch_mean", None)
+			new_layer.register_buffer("running_mean", 
+				torch.zeros(new_layer.in_channels, 
+				device=new_layer.weight.device))
+
 		return new_layer
 
 	def forward(self, x):
+		# all demeaning and saving decorrelation layer inputs happens in the
+		# main forward pass function for Mamba, check that there!
 		return conv1d(x, self.fused_weight, self.bias, 
 				self.stride, self.padding, self.dilation, self.groups)
 
@@ -423,8 +412,8 @@ class DecorrMamba(MambaLMHeadModel):
 	"""Extends MambaLMHeadModel by integrating decorrelation layers into the architecture."""
 
 	def __init__(self, existing_model: MambaLMHeadModel = None, copy: bool = False, 
-			  kappa: float = 0.5, sample_frac: float = 0.1, decorr_lr: float = None,
-			  compute_loss: bool = True, **factory_kwargs):
+			  kappa: float = 0.5, sample_frac: float = 0.1,
+			  compute_loss: bool = True, demeaning: bool = False, **factory_kwargs):
 		"""
 		Initializes a DecorrMamba model by adding decorrelation layers to the existing model.
 
@@ -433,7 +422,6 @@ class DecorrMamba(MambaLMHeadModel):
 			copy (bool): Whether to deep copy the existing model.
 			kappa (float): Scaling factor for decorrelation loss.
 			sample_frac (float): Fraction of samples used for decorrelation computation.
-			decorr_lr (float, optional): Learning rate for decorrelation matrix updates.
 			compute_loss (bool): Whether to compute decorrelation loss.
 			**factory_kwargs: Additional arguments for model initialization.
 		"""
@@ -451,6 +439,7 @@ class DecorrMamba(MambaLMHeadModel):
 		else:
 			super(DecorrMamba, self).__init__(**factory_kwargs)
 
+		self.demeaning = demeaning
 		self.n_decorr_layers = 0 # used for averaging the decorr losses later
 		# used for referencing decorrelation layers directly without looping
 		# over complete model structure
@@ -475,7 +464,8 @@ class DecorrMamba(MambaLMHeadModel):
 					self.n_decorr_layers += 1
 					setattr(module, name, DecorrLinear.from_existing_layer(
 						original_layer=child, compute_loss=compute_loss, 
-						kappa=kappa, sample_frac=sample_frac))
+						kappa=kappa, sample_frac=sample_frac, 
+						demeaning=demeaning))
 					
 					self.decorr_layers.append(getattr(module, name))
 
@@ -483,14 +473,15 @@ class DecorrMamba(MambaLMHeadModel):
 					self.n_decorr_layers += 1 				
 					setattr(module, name, DecorrConv1d.from_existing_layer(
 						original_layer=child, compute_loss=compute_loss,
-						kappa=kappa, sample_frac=sample_frac))
+						kappa=kappa, sample_frac=sample_frac,
+						demeaning=demeaning))
+					
 					self.decorr_layers.append(getattr(module, name))
 
 		self.apply(_create_decorr_matrices)
 
 		self.mean_corr_loss = None
 		self.mean_whit_loss = None
-		self.decorr_lr = decorr_lr
 
 		# These are here for reference only, these have been passed to 
 		# the decorrelation modules and they work inside there. 
@@ -501,15 +492,16 @@ class DecorrMamba(MambaLMHeadModel):
 		def _modify_mamba_block_functions(module):
 			for _, child in module.named_children():
 				if type(child) is Mamba:
-					child.forward = self._mamba_block_forward.__get__(child)
-					child.step = self._mamba_block_step.__get__(child)	
-				elif type(child) is Mamba2:
-					child.forward = self._mamba2_block_forward.__get__(child)
-					child.step = self._mamba2_block_step.__get__(child)						
+					child.forward = partial(self._mamba_block_forward.__get__(child), demeaning=demeaning)
+					child.step = partial(self._mamba_block_step.__get__(child), demeaning=demeaning)	
+				# elif type(child) is Mamba2:
+				# 	child.forward = self._mamba2_block_forward.__get__(child)
+				# 	child.step = self._mamba2_block_step.__get__(child)		
+			
 
 		self.apply(_modify_mamba_block_functions)
 
-	def _mamba_block_forward(self, hidden_states, inference_params=None, to_remove=[]):
+	def _mamba_block_forward(self, hidden_states, inference_params=None, to_remove=[], demeaning=False):
 		"""
 		hidden_states: (B, L, D)
 		Returns: same shape as hidden_states
@@ -524,8 +516,26 @@ class DecorrMamba(MambaLMHeadModel):
 		conv1d_weight = self.conv1d.fused_weight if not "conv1d" in to_remove else self.conv1d.weight
 		x_proj_weight = self.x_proj.fused_weight if not "x_proj" in to_remove else self.x_proj.weight
 
+		assert self.in_proj.demeaning == self.x_proj.demeaning == \
+			self.conv1d.demeaning == self.out_proj.demeaning, "Must have demeaning set the same for all layers"
+		
 		if not "in_proj" in to_remove:
-			self.in_proj.inputs = hidden_states.detach()
+			if demeaning:
+				if self.training:
+					# save this mean for updating the running average, and use
+					# it to de-mean the current batch
+					with torch.no_grad():
+						self.in_proj.batch_mean = \
+							torch.mean(
+								hidden_states.detach(), axis=[0,1])
+					hidden_states = hidden_states - self.in_proj.batch_mean[None, None, :]
+				else:
+					# use the running average to de-mean
+					hidden_states = hidden_states - self.in_proj.running_mean[None, None, :]
+
+			# save inputs for decorrelation layer update
+			if self.training:
+				self.in_proj.inputs = hidden_states.detach()
 
 		batch, seqlen, dim = hidden_states.shape
 
@@ -538,7 +548,6 @@ class DecorrMamba(MambaLMHeadModel):
 				return out
 
 		# We do matmul and transpose BLH -> HBL at the same time
-
 		xz = rearrange(
 			in_proj_weight @ rearrange(hidden_states, "b l d -> d (b l)"),
 			"d (b l) -> b d l",
@@ -555,7 +564,15 @@ class DecorrMamba(MambaLMHeadModel):
 			
 		# In the backward pass we write dx and dz next to each other to avoid torch.cat
 		if self.use_fast_path and causal_conv1d_fn is not None and inference_params is None:  # Doesn't support outputting the states
-			out, layer_inputs = decorr_mamba_inner_fn(
+			running_means = None
+			if not self.training and demeaning:
+				running_means = {
+					"conv1d": self.conv1d.running_mean,
+					"x_proj": self.x_proj.running_mean,
+					"out_proj": self.out_proj.running_mean
+				}
+
+			out, decorr_train_info = decorr_mamba_inner_fn(
 				xz,
 				conv1d_weight,
 				self.conv1d.bias,
@@ -569,15 +586,18 @@ class DecorrMamba(MambaLMHeadModel):
 				self.D.float(),
 				delta_bias=self.dt_proj.bias.float(),
 				delta_softplus=True,
+				demeaning=demeaning,
+				running_means=running_means
 			)
 
-			# not clean but more readable than getattr() type stuff
-			if not "conv1d" in to_remove:
-				self.conv1d.inputs = layer_inputs["conv1d"]
-			if not "x_proj" in to_remove:
-				self.x_proj.inputs = layer_inputs["x_proj"]
-			if not "out_proj" in to_remove:
-				self.out_proj.inputs = layer_inputs["out_proj"]
+			# setting the necessary attributes to perform a training step
+			if self.training:
+				for layer_name in ["conv1d", "x_proj", "out_proj"]:
+					if layer_name not in to_remove:
+						layer = getattr(self, layer_name)
+						layer.inputs = decorr_train_info["inputs"][layer_name]
+						if layer.demeaning:
+							layer.batch_mean = decorr_train_info["means"][layer_name]
 
 		else: 
 			x, z = xz.chunk(2, dim=1)
@@ -588,7 +608,18 @@ class DecorrMamba(MambaLMHeadModel):
 				conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
 
 			if not "conv1d" in to_remove:
-				self.conv1d.inputs = x.detach()
+				if demeaning:
+					if self.training:
+						with torch.no_grad():
+							self.conv1d.batch_mean = \
+								torch.mean(
+									x.detach(), axis=[0,2])
+							
+						x = x - self.conv1d.batch_mean[None, :, None]
+					else:
+						x = x - self.conv1d.running_mean[None, :, None]
+				if self.training:
+					self.conv1d.inputs = x.detach()
 				
 			if causal_conv1d_fn is None:
 				x = self.act(self.conv1d(x)[..., :seqlen])
@@ -604,8 +635,19 @@ class DecorrMamba(MambaLMHeadModel):
 			# We're careful here about the layout, to avoid extra transposes.
 			# We want dt to have d as the slowest moving dimension
 			# and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
+
 			if not "x_proj" in to_remove:
-				self.x_proj.inputs = rearrange(x, "b d l -> b l d").detach()
+				if self.x_proj.demeaning:
+					if self.training:
+						with torch.no_grad():
+							self.x_proj.batch_mean = torch.mean(
+								x, axis=[0,2])
+							
+						x = x - self.x_proj.batch_mean[None, :, None]
+					else:
+						x = x - self.x_proj.running_mean[None, :, None]
+				if self.training:
+					self.x_proj.inputs = rearrange(x.detach(), "b d l -> b l d")
 			
 			x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (bl d)
 			dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
@@ -629,33 +671,45 @@ class DecorrMamba(MambaLMHeadModel):
 			if ssm_state is not None:
 				y, last_state = y
 				ssm_state.copy_(last_state)
+
 			y = rearrange(y, "b d l -> b l d")
 
 			if not "out_proj" in self.to_remove:
-				self.out_proj.inputs = y.detach()
+				if self.out_proj.demeaning:
+					if self.training:
+						with torch.no_grad():
+							self.out_proj.batch_mean = torch.mean(
+								y, axis=[0,1])
+						y = y - self.out_proj.batch_mean[None, None, :]
+					else:
+						y = y - self.out_proj.running_mean[None, None, :]
+				
+				if self.training:
+					self.out_proj.inputs = y.detach()
 
 			out = self.out_proj(y)
 
 		return out
 
-	def _mamba_block_step(self, hidden_states, conv_state, ssm_state, to_remove=[]):
+	def _mamba_block_step(self, hidden_states, conv_state, ssm_state, to_remove=[], demeaning=False):
 
 		conv1d_weight = self.conv1d.fused_weight if not "conv1d" in to_remove else self.conv1d.weight
 
 		dtype = hidden_states.dtype
 		assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
+		
+		# de-meaning of the input here has already happened in _mamba_block_forward!
 
-		# input logging for this one already taken care of in forward function
 		xz = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
 		x, z = xz.chunk(2, dim=-1)  # (B D)
+
+		if demeaning:
+			x = x - self.conv1d.running_mean[None, :]
 
 		# Conv step
 		if causal_conv1d_update is None:
 			conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
 			conv_state[:, :, -1] = x
-			
-			if not "conv1d" in to_remove:
-				self.conv1d.inputs = conv_state.detach()
 
 			x = torch.sum(conv_state * rearrange(conv1d_weight, "d 1 w -> d w"), dim=-1)  # (B D)
 			if self.conv1d.bias is not None:
@@ -663,9 +717,6 @@ class DecorrMamba(MambaLMHeadModel):
 			x = self.act(x).to(dtype=dtype)
 		else:
 			
-			if not "conv1d" in to_remove:
-				self.conv1d.inputs = x.detach()
-
 			x = causal_conv1d_update(
 				x,
 				conv_state,
@@ -673,6 +724,9 @@ class DecorrMamba(MambaLMHeadModel):
 				self.conv1d.bias,
 				self.activation,
 			)
+
+		if demeaning:
+			x = x - self.x_proj.running_mean[None, :]
 
 		x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
 		dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
@@ -700,218 +754,221 @@ class DecorrMamba(MambaLMHeadModel):
 				ssm_state, x, dt, A, B, C, self.D, z=z, dt_bias=self.dt_proj.bias, dt_softplus=True
 			)
 
-		out = self.out_proj(y)
-		return out.unsqueeze(1), conv_state, ssm_state
-
-	def _mamba2_block_forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None):
-		"""
-		u: (batch, seqlen, hidden_dim) if seqlen=None.
-			If seqlen is not None, u is (batch * seqlen, hidden_dim). This is so that when we
-			split u during sequence parallel, we split the batch * seqlen dimension
-			(in case batch is small).
-		Returns: same shape as u
-		"""
-		seqlen_og = seqlen
-		if seqlen is None:
-			batch, seqlen, dim = u.shape
-		else:
-			batch_seqlen, dim = u.shape
-			batch = batch_seqlen // seqlen
-
-		conv_state, ssm_state = None, None
-		if inference_params is not None:
-			inference_batch = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else batch
-			conv_state, ssm_state = self._get_states_from_cache(inference_params, inference_batch)
-			if inference_params.seqlen_offset > 0:
-				# The states are updated inplace
-				out, _, _ = self.step(u, conv_state, ssm_state)
-				return out
-			
-		self.in_proj.inputs = u.detach()
-		zxbcdt = self.in_proj(u)  # (B, L, d_in_proj) or (B * L, d_in_proj)
-		if seqlen_og is not None:
-			zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
-		# If the model is loaded in fp16, without the .float() here, A might be -inf
-		A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
-		dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
-		if self.use_mem_eff_path and inference_params is None:
-			out, layer_inputs = decorr_mamba_split_conv1d_scan_combined(
-				zxbcdt,
-				rearrange(self.conv1d.fused_weight, "d 1 w -> d w"),
-				self.conv1d.bias,
-				self.dt_bias,
-				A,
-				D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
-				chunk_size=self.chunk_size,
-				seq_idx=seq_idx,
-				activation=self.activation,
-				rmsnorm_weight=self.norm.weight if self.rmsnorm else None,
-				rmsnorm_eps=self.norm.eps if self.rmsnorm else 1e-6,
-				outproj_weight=self.out_proj.fused_weight,
-				outproj_bias=self.out_proj.bias,
-				headdim=None if self.D_has_hdim else self.headdim,
-				ngroups=self.ngroups,
-				norm_before_gate=self.norm_before_gate,
-				**dt_limit_kwargs,
-			)
-
-			self.conv1d.inputs = layer_inputs["conv1d"]
-			self.out_proj.inputs = layer_inputs["out_proj"]
-
-			if seqlen_og is not None:
-				out = rearrange(out, "b l d -> (b l) d")
-			if self.process_group is not None:
-				reduce_fn = reduce_scatter if self.sequence_parallel else all_reduce
-				out = reduce_fn(out, self.process_group)
-		else:
-			d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
-			z0, x0, z, xBC, dt = torch.split(
-				zxbcdt,
-				[d_mlp, d_mlp, self.d_ssm, self.d_ssm + 2 * self.ngroups * self.d_state, self.nheads],
-				dim=-1
-			)
-			if conv_state is not None:
-				if cu_seqlens is None:
-					# If we just take xBC[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-					# Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-					xBC_t = rearrange(xBC, "b l d -> b d l")
-					conv_state.copy_(F.pad(xBC_t, (self.d_conv - xBC_t.shape[-1], 0)))  # Update state (B D W)
-				else:
-					assert causal_conv1d_varlen_states is not None, "varlen inference requires causal_conv1d package"
-					assert batch == 1, "varlen inference only supports batch dimension 1"
-					conv_varlen_states = causal_conv1d_varlen_states(
-						xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
-					)
-					conv_state.copy_(conv_varlen_states)
-			assert self.activation in ["silu", "swish"]
-
-			self.conv1d.inputs = xBC.detach().transpose(1,2)
-
-			if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
-				assert seq_idx is None, "varlen conv1d requires the causal_conv1d package"
-				xBC = self.act(
-					self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :-(self.d_conv - 1)]
-				)  # (B, L, self.d_ssm + 2 * ngroups * d_state)
-			else:
-				xBC = causal_conv1d_fn(
-					xBC.transpose(1, 2),
-					rearrange(self.conv1d.fused_weight, "d 1 w -> d w"),
-					bias=self.conv1d.bias,
-					activation=self.activation,
-					seq_idx=seq_idx,
-				).transpose(1, 2)
-			x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
-			y = mamba_chunk_scan_combined(
-				rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
-				dt,
-				A,
-				rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
-				rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
-				chunk_size=self.chunk_size,
-				D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
-				z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
-				dt_bias=self.dt_bias,
-				dt_softplus=True,
-				seq_idx=seq_idx,
-				cu_seqlens=cu_seqlens,
-				**dt_limit_kwargs,
-				return_final_states=ssm_state is not None,
-				return_varlen_states=cu_seqlens is not None and inference_params is not None,
-			)
-			if ssm_state is not None:
-				y, last_state, *rest = y
-				if cu_seqlens is None:
-					ssm_state.copy_(last_state)
-				else:
-					varlen_states = rest[0]
-					ssm_state.copy_(varlen_states)
-			y = rearrange(y, "b l h p -> b l (h p)")
-			if self.rmsnorm:
-				y = self.norm(y, z)
-			if d_mlp > 0:
-				y = torch.cat([F.silu(z0) * x0, y], dim=-1)
-			if seqlen_og is not None:
-				y = rearrange(y, "b l d -> (b l) d")
-
-			self.out_proj.inputs = y.detach()
-			
-			out = self.out_proj(y)
-		return out
-
-	def _mamba2_block_step(self, hidden_states, conv_state, ssm_state):
-		dtype = hidden_states.dtype
-		assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
-
-		self.in_proj.inputs = hidden_states.detach().squeeze(1)
-
-		zxbcdt = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
-		d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
-		z0, x0, z, xBC, dt = torch.split(
-			zxbcdt,
-			[d_mlp, d_mlp, self.d_ssm, self.d_ssm + 2 * self.ngroups * self.d_state, self.nheads],
-			dim=-1
-		)
-
-		self.conv1d.inputs = xBC.detach()
-
-		# Conv step
-		if causal_conv1d_update is None:
-			conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
-			conv_state[:, :, -1] = xBC
-			xBC = torch.sum(conv_state * rearrange(self.conv1d.fused_weight, "d 1 w -> d w"), dim=-1)  # (B D)
-			if self.conv1d.bias is not None:
-				xBC = xBC + self.conv1d.bias
-			xBC = self.act(xBC).to(dtype=dtype)
-		else:
-			xBC = causal_conv1d_update(
-				xBC,
-				conv_state,
-				rearrange(self.conv1d.fused_weight, "d 1 w -> d w"),
-				self.conv1d.bias,
-				self.activation,
-			)
-
-		x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
-		A = -torch.exp(self.A_log.float())  # (nheads,)
-
-		# SSM step
-		if selective_state_update is None:
-			assert self.ngroups == 1, "Only support ngroups=1 for this inference code path"
-			# Discretize A and B
-			dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
-			dA = torch.exp(dt * A)  # (batch, nheads)
-			x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
-			dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
-			ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
-			y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
-			y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
-			y = rearrange(y, "b h p -> b (h p)")
-			if not self.rmsnorm:
-				y = y * self.act(z)  # (B D)
-		else:
-			A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
-			dt = repeat(dt, "b h -> b h p", p=self.headdim)
-			dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
-			D = repeat(self.D, "h -> h p", p=self.headdim)
-			B = rearrange(B, "b (g n) -> b g n", g=self.ngroups)
-			C = rearrange(C, "b (g n) -> b g n", g=self.ngroups)
-			x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
-			if not self.rmsnorm:
-				z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
-			y = selective_state_update(
-				ssm_state, x_reshaped, dt, A, B, C, D, z=z if not self.rmsnorm else None,
-				dt_bias=dt_bias, dt_softplus=True
-			)
-			y = rearrange(y, "b h p -> b (h p)")
-		if self.rmsnorm:
-			y = self.norm(y, z)
-		if d_mlp > 0:
-			y = torch.cat([F.silu(z0) * x0, y], dim=-1)
-
-		self.out_proj.inputs = y.detach()
+		if demeaning:
+			y = y - self.out_proj.running_mean[None, :]
 
 		out = self.out_proj(y)
 		return out.unsqueeze(1), conv_state, ssm_state
+
+	# def _mamba2_block_forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None):
+	# 	"""
+	# 	u: (batch, seqlen, hidden_dim) if seqlen=None.
+	# 		If seqlen is not None, u is (batch * seqlen, hidden_dim). This is so that when we
+	# 		split u during sequence parallel, we split the batch * seqlen dimension
+	# 		(in case batch is small).
+	# 	Returns: same shape as u
+	# 	"""
+	# 	seqlen_og = seqlen
+	# 	if seqlen is None:
+	# 		batch, seqlen, dim = u.shape
+	# 	else:
+	# 		batch_seqlen, dim = u.shape
+	# 		batch = batch_seqlen // seqlen
+
+	# 	conv_state, ssm_state = None, None
+	# 	if inference_params is not None:
+	# 		inference_batch = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else batch
+	# 		conv_state, ssm_state = self._get_states_from_cache(inference_params, inference_batch)
+	# 		if inference_params.seqlen_offset > 0:
+	# 			# The states are updated inplace
+	# 			out, _, _ = self.step(u, conv_state, ssm_state)
+	# 			return out
+			
+	# 	self.in_proj.inputs = u.detach()
+	# 	zxbcdt = self.in_proj(u)  # (B, L, d_in_proj) or (B * L, d_in_proj)
+	# 	if seqlen_og is not None:
+	# 		zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
+	# 	# If the model is loaded in fp16, without the .float() here, A might be -inf
+	# 	A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
+	# 	dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
+	# 	if self.use_mem_eff_path and inference_params is None:
+	# 		out, layer_inputs = decorr_mamba_split_conv1d_scan_combined(
+	# 			zxbcdt,
+	# 			rearrange(self.conv1d.fused_weight, "d 1 w -> d w"),
+	# 			self.conv1d.bias,
+	# 			self.dt_bias,
+	# 			A,
+	# 			D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
+	# 			chunk_size=self.chunk_size,
+	# 			seq_idx=seq_idx,
+	# 			activation=self.activation,
+	# 			rmsnorm_weight=self.norm.weight if self.rmsnorm else None,
+	# 			rmsnorm_eps=self.norm.eps if self.rmsnorm else 1e-6,
+	# 			outproj_weight=self.out_proj.fused_weight,
+	# 			outproj_bias=self.out_proj.bias,
+	# 			headdim=None if self.D_has_hdim else self.headdim,
+	# 			ngroups=self.ngroups,
+	# 			norm_before_gate=self.norm_before_gate,
+	# 			**dt_limit_kwargs,
+	# 		)
+
+	# 		self.conv1d.inputs = layer_inputs["conv1d"]
+	# 		self.out_proj.inputs = layer_inputs["out_proj"]
+
+	# 		if seqlen_og is not None:
+	# 			out = rearrange(out, "b l d -> (b l) d")
+	# 		if self.process_group is not None:
+	# 			reduce_fn = reduce_scatter if self.sequence_parallel else all_reduce
+	# 			out = reduce_fn(out, self.process_group)
+	# 	else:
+	# 		d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
+	# 		z0, x0, z, xBC, dt = torch.split(
+	# 			zxbcdt,
+	# 			[d_mlp, d_mlp, self.d_ssm, self.d_ssm + 2 * self.ngroups * self.d_state, self.nheads],
+	# 			dim=-1
+	# 		)
+	# 		if conv_state is not None:
+	# 			if cu_seqlens is None:
+	# 				# If we just take xBC[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+	# 				# Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+	# 				xBC_t = rearrange(xBC, "b l d -> b d l")
+	# 				conv_state.copy_(F.pad(xBC_t, (self.d_conv - xBC_t.shape[-1], 0)))  # Update state (B D W)
+	# 			else:
+	# 				assert causal_conv1d_varlen_states is not None, "varlen inference requires causal_conv1d package"
+	# 				assert batch == 1, "varlen inference only supports batch dimension 1"
+	# 				conv_varlen_states = causal_conv1d_varlen_states(
+	# 					xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
+	# 				)
+	# 				conv_state.copy_(conv_varlen_states)
+	# 		assert self.activation in ["silu", "swish"]
+
+	# 		self.conv1d.inputs = xBC.detach().transpose(1,2)
+
+	# 		if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
+	# 			assert seq_idx is None, "varlen conv1d requires the causal_conv1d package"
+	# 			xBC = self.act(
+	# 				self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :-(self.d_conv - 1)]
+	# 			)  # (B, L, self.d_ssm + 2 * ngroups * d_state)
+	# 		else:
+	# 			xBC = causal_conv1d_fn(
+	# 				xBC.transpose(1, 2),
+	# 				rearrange(self.conv1d.fused_weight, "d 1 w -> d w"),
+	# 				bias=self.conv1d.bias,
+	# 				activation=self.activation,
+	# 				seq_idx=seq_idx,
+	# 			).transpose(1, 2)
+	# 		x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+	# 		y = mamba_chunk_scan_combined(
+	# 			rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
+	# 			dt,
+	# 			A,
+	# 			rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
+	# 			rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
+	# 			chunk_size=self.chunk_size,
+	# 			D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
+	# 			z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
+	# 			dt_bias=self.dt_bias,
+	# 			dt_softplus=True,
+	# 			seq_idx=seq_idx,
+	# 			cu_seqlens=cu_seqlens,
+	# 			**dt_limit_kwargs,
+	# 			return_final_states=ssm_state is not None,
+	# 			return_varlen_states=cu_seqlens is not None and inference_params is not None,
+	# 		)
+	# 		if ssm_state is not None:
+	# 			y, last_state, *rest = y
+	# 			if cu_seqlens is None:
+	# 				ssm_state.copy_(last_state)
+	# 			else:
+	# 				varlen_states = rest[0]
+	# 				ssm_state.copy_(varlen_states)
+	# 		y = rearrange(y, "b l h p -> b l (h p)")
+	# 		if self.rmsnorm:
+	# 			y = self.norm(y, z)
+	# 		if d_mlp > 0:
+	# 			y = torch.cat([F.silu(z0) * x0, y], dim=-1)
+	# 		if seqlen_og is not None:
+	# 			y = rearrange(y, "b l d -> (b l) d")
+
+	# 		self.out_proj.inputs = y.detach()
+			
+	# 		out = self.out_proj(y)
+	# 	return out
+
+	# def _mamba2_block_step(self, hidden_states, conv_state, ssm_state):
+	# 	dtype = hidden_states.dtype
+	# 	assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
+
+	# 	self.in_proj.inputs = hidden_states.detach().squeeze(1)
+
+	# 	zxbcdt = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
+	# 	d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
+	# 	z0, x0, z, xBC, dt = torch.split(
+	# 		zxbcdt,
+	# 		[d_mlp, d_mlp, self.d_ssm, self.d_ssm + 2 * self.ngroups * self.d_state, self.nheads],
+	# 		dim=-1
+	# 	)
+
+	# 	self.conv1d.inputs = xBC.detach()
+
+	# 	# Conv step
+	# 	if causal_conv1d_update is None:
+	# 		conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
+	# 		conv_state[:, :, -1] = xBC
+	# 		xBC = torch.sum(conv_state * rearrange(self.conv1d.fused_weight, "d 1 w -> d w"), dim=-1)  # (B D)
+	# 		if self.conv1d.bias is not None:
+	# 			xBC = xBC + self.conv1d.bias
+	# 		xBC = self.act(xBC).to(dtype=dtype)
+	# 	else:
+	# 		xBC = causal_conv1d_update(
+	# 			xBC,
+	# 			conv_state,
+	# 			rearrange(self.conv1d.fused_weight, "d 1 w -> d w"),
+	# 			self.conv1d.bias,
+	# 			self.activation,
+	# 		)
+
+	# 	x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+	# 	A = -torch.exp(self.A_log.float())  # (nheads,)
+
+	# 	# SSM step
+	# 	if selective_state_update is None:
+	# 		assert self.ngroups == 1, "Only support ngroups=1 for this inference code path"
+	# 		# Discretize A and B
+	# 		dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
+	# 		dA = torch.exp(dt * A)  # (batch, nheads)
+	# 		x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+	# 		dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
+	# 		ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+	# 		y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
+	# 		y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
+	# 		y = rearrange(y, "b h p -> b (h p)")
+	# 		if not self.rmsnorm:
+	# 			y = y * self.act(z)  # (B D)
+	# 	else:
+	# 		A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
+	# 		dt = repeat(dt, "b h -> b h p", p=self.headdim)
+	# 		dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
+	# 		D = repeat(self.D, "h -> h p", p=self.headdim)
+	# 		B = rearrange(B, "b (g n) -> b g n", g=self.ngroups)
+	# 		C = rearrange(C, "b (g n) -> b g n", g=self.ngroups)
+	# 		x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+	# 		if not self.rmsnorm:
+	# 			z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
+	# 		y = selective_state_update(
+	# 			ssm_state, x_reshaped, dt, A, B, C, D, z=z if not self.rmsnorm else None,
+	# 			dt_bias=dt_bias, dt_softplus=True
+	# 		)
+	# 		y = rearrange(y, "b h p -> b (h p)")
+	# 	if self.rmsnorm:
+	# 		y = self.norm(y, z)
+	# 	if d_mlp > 0:
+	# 		y = torch.cat([F.silu(z0) * x0, y], dim=-1)
+
+	# 	self.out_proj.inputs = y.detach()
+
+	# 	out = self.out_proj(y)
+	# 	return out.unsqueeze(1), conv_state, ssm_state
 
 	def forward(self, x):
 		# fuse decorrelation + main model parameters, then let forward
@@ -966,20 +1023,48 @@ class DecorrMamba(MambaLMHeadModel):
 		"""
 		self.apply_to_decorr(lambda x: x.fuse_decorr())
 
-	def decorr_operations(self):
+	def decorr_operations(self, crop_frac: float = 1.0):
 		""" 
 		Performs all decorrelation operations (loss and/or gradient computation, 
 		depending on configuration)."""
+		# crop_frac is used in case we want to sample even less than one 
+		# sequence. We shorten the sequence length to accomplish this!
+		def cropped_decorr_op(module):
 
-		self.apply_to_decorr(lambda x: x.compute_decorr_grad_loss(x.inputs))
+			if isinstance(module, DecorrLinear):
+				# inputs of shape (B,L,D)
+				_, L, _ = module.inputs.shape
+				cropped_len = int(crop_frac*L)
+				module.compute_decorr_grad_loss(
+					module.inputs[:, :cropped_len, :])
+			elif isinstance(module, DecorrConv1d):
+				# inputs of shape (B, D, L)
+				_, _, L = module.inputs.shape
+				cropped_len = int(crop_frac*L)
+				module.compute_decorr_grad_loss(
+					module.inputs[:, :, :cropped_len])	
+			else:
+				cropped_len = None
+				return NotImplementedError
+			
+			assert cropped_len >= 1, "Cropping length too small!"
+			
+		self.apply_to_decorr(cropped_decorr_op)
 
-	def update_decorr_matrices(self):
+	def update_decorr_matrices(self, decorr_lr: float, demeaning_lr: float = None):
 		""" 
 		Updates the decorrelation matrices for all decorrelation layers
 		within the model
 		"""
-		assert self.decorr_lr is not None, "No decorr_lr specified"
-		self.apply_to_decorr(lambda x: x.update_decorr_matrices(self.decorr_lr))
+		def _update(module):
+			module.update_decorr_matrix(decorr_lr)
+			if self.demeaning:
+				assert demeaning_lr is not None, "Must supply demeaning_lr for demeaning!"
+				with torch.no_grad():
+					module.running_mean.add_(
+						demeaning_lr * (module.batch_mean - module.running_mean))
+												 
+		self.apply_to_decorr(_update)
 
 	def apply_to_decorr(self, f: callable):
 		"""
@@ -1008,8 +1093,9 @@ class DecorrMamba(MambaLMHeadModel):
 class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 	""" Decorrelated version of SaShiMiMamba."""
 	def __init__(self, existing_model: SaShiMiMamba = None, copy: bool = False, 
-			  kappa: float = 0.5, sample_frac: float = 0.1, decorr_lr: float = None,
-			  compute_loss: bool = True, to_remove: list[str] = None, **factory_kwargs):
+			  kappa: float = 0.5, sample_frac: float = 0.1,
+			  compute_loss: bool = True, to_remove: list[str] = [], 
+			  demeaning: bool = False, **factory_kwargs):
 		
 		if existing_model and copy:
 			self.__dict__.update(deepcopy(existing_model).__dict__)
@@ -1031,6 +1117,7 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 		# over complete model structure
 		self.decorr_layers = []
 		self.to_remove = to_remove
+		self.demeaning=demeaning
 
 		def _create_decorr_matrices(module):
 			""" 
@@ -1050,7 +1137,7 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 					self.n_decorr_layers += 1
 					setattr(module, name, DecorrLinear.from_existing_layer(
 						original_layer=child, compute_loss=compute_loss, 
-						kappa=kappa, sample_frac=sample_frac))
+						kappa=kappa, sample_frac=sample_frac, demeaning=demeaning))
 					
 					self.decorr_layers.append(getattr(module, name))
 
@@ -1058,14 +1145,13 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 					self.n_decorr_layers += 1 				
 					setattr(module, name, DecorrConv1d.from_existing_layer(
 						original_layer=child, compute_loss=compute_loss,
-						kappa=kappa, sample_frac=sample_frac))
+						kappa=kappa, sample_frac=sample_frac, demeaning=demeaning))
 					self.decorr_layers.append(getattr(module, name))
 
 		self.apply(_create_decorr_matrices)
 
 		self.mean_corr_loss = None
 		self.mean_whit_loss = None
-		self.decorr_lr = decorr_lr
 
 		# These are here for reference only, these have been passed to 
 		# the decorrelation modules and they work inside there. 
@@ -1076,11 +1162,11 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 		def _modify_mamba_block_functions(module):
 			for _, child in module.named_children():
 				if type(child) is Mamba:
-					child.forward = partial(self._mamba_block_forward.__get__(child), to_remove=to_remove)
-					child.step = partial(self._mamba_block_step.__get__(child), to_remove=to_remove)
-				elif type(child) is Mamba2:
-					child.forward = self._mamba2_block_forward.__get__(child)
-					child.step = self._mamba2_block_step.__get__(child)						
+					child.forward = partial(self._mamba_block_forward.__get__(child), to_remove=to_remove, demeaning=demeaning)
+					child.step = partial(self._mamba_block_step.__get__(child), to_remove=to_remove, demeaning=demeaning)
+				# elif type(child) is Mamba2:
+				# 	child.forward = self._mamba2_block_forward.__get__(child)
+				# 	child.step = self._mamba2_block_step.__get__(child)				
 
 		self.apply(_modify_mamba_block_functions)
 
@@ -1091,15 +1177,20 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 			self.fuse_decorr()
 
 		# down sample and keep residuals
+		# NB demeaning is already handled in the Mamba blocks, we just need to
+		# perform demeaning manually for the up and down-pooling layers.
+
 		x = self.embedding(x) 
 		residuals = []
 		for dp, blocks in zip(self.down_pooling, 
 			self.mamba_stages_down[:-1]):
 			residuals.append(x)
 			x = blocks(x)
-			# inputs are captured by Mamba blocks separately
+			# inputs are captured (and optionally demeaned) by Mamba blocks separately
 			if isinstance(dp.down_pool, DecorrLinear):
-				dp.capture_inputs = True
+				dp.capture_inputs = self.training
+				dp.demeaning = self.demeaning
+
 			x = dp(x)
 
 		residuals.append(x)
@@ -1112,7 +1203,8 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 		for up, blocks in zip(
 			reversed(self.up_pooling), reversed(self.mamba_stages_up)):
 			if isinstance(up.up_pool, DecorrLinear):
-				up.capture_inputs = True
+				up.capture_inputs = self.training
+				up.demeaning = self.demeaning
 			u = up(x)
 			x = u + residuals.pop()
 			x = blocks(x)

@@ -39,6 +39,9 @@ class TrainingArgs():
 	# steps
 	warmup_steps: int
 
+	demeaning: bool = False
+	demeaning_lr: float = None
+	decorr_lr: float = None
 	optimizer: str = "adam"
 	
 	def __post_init__(self):

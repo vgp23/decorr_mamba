@@ -46,13 +46,13 @@ class DecorrLRScheduler():
 	''' 
 	Scheduler for the decorrelation learning rate. Can't directly use the
 	logic of the PyTorch scheduler as it's tied to a particular optimizer.'''
-	def __init__(self, model: None, lr_lambda: None):
-		self.model = model
-		self.init_lr = model.decorr_lr
-		self.lr_lambda = lr_lambda
+	def __init__(self, train_args: TrainingArgs):
+		self.train_args = train_args
+		self.init_lr = train_args.decorr_lr
+		self.lr_lambda = self.train_args.schedule_fn
 
 	def step(self, step):
-		self.model.decorr_lr = self.init_lr * self.lr_lambda(step)
+		self.train_args.decorr_lr = self.init_lr * self.lr_lambda(step)
 
 
 class MambaTrainer:
@@ -125,27 +125,31 @@ class MambaTrainer:
 		processes, for each decorrelation layer.
 
 		"""
+		world_size = torch.distributed.get_world_size()
+		
+		def _average(n):
+			torch.distributed.all_reduce(
+			n, op=torch.distributed.ReduceOp.SUM)
+			n /= world_size
 
 		def _sync_one_param(layer: torch.nn.Parameter):
-			world_size = torch.distributed.get_world_size()
+
 			# averaging gradients
 			assert layer.decorr_layer.grad is not None, "Gradients not computed!"
-
-			torch.distributed.all_reduce(
-				layer.decorr_layer.grad, op=torch.distributed.ReduceOp.SUM)
-			layer.decorr_layer.grad /= world_size
+			_average(layer.decorr_layer.grad)
 
 			# averaging losses
 			if layer.whit_loss is not None:
-				torch.distributed.all_reduce(
-					layer.whit_loss, op=torch.distributed.ReduceOp.SUM)
-				layer.whit_loss /= world_size
+				_average(layer.whit_loss)
 
 			if layer.corr_loss is not None:
-				torch.distributed.all_reduce(
-					layer.corr_loss, op=torch.distributed.ReduceOp.SUM)
-				layer.corr_loss /= world_size
-
+				_average(layer.corr_loss)
+			
+			# averaging batch means
+			if self.train_args.demeaning:
+				assert layer.batch_mean is not None, f"Batch mean not available for layer {layer}"
+				_average(layer.batch_mean)
+			
 		with torch.no_grad():
 			self.get_model().apply_to_decorr(lambda x: _sync_one_param(x))
 
@@ -175,7 +179,8 @@ class MambaTrainer:
 	def train_sequence_steps(self, train_loader, val_loader: DataLoader, test_loader:DataLoader,
 		use_amp: bool, log_freq: int, n_val: int, train_backprop: bool=True, 
 		train_decorr: bool=True, save_checkpoints: bool=True, pad_idx: int = None,
-		skip_init_val: bool=False, datashuffle_seed: int=0, metric="ppl", val_sched_base: int=20):
+		skip_init_val: bool=False, datashuffle_seed: int=0, metric="ppl", val_sched_base: int=20,
+		crop_frac: float = 1.0, decorr_update_freq: int = 1):
 
 		''' 
 		Trains the model with the protocol specified in train_args. Trains based
@@ -273,7 +278,7 @@ class MambaTrainer:
 			# too!
 			if isinstance(self.get_model(), DecorrMamba):
 				decorr_scheduler = DecorrLRScheduler(
-					model=self.get_model(), lr_lambda=self.train_args.schedule_fn)
+					train_args=self.train_args)
 
 			# visualize learning rate schedule for the backprop parameters
 			# NOTE: DOES NOT WORK FOR THE DECORRELATION LR!! 
@@ -289,6 +294,9 @@ class MambaTrainer:
 
 		val_sched = generate_fixed_exponential_schedule(
 			num_iterations=self.train_args.n_steps, num_validations=n_val, base=val_sched_base)
+		
+		decorr_update_sched = [i*decorr_update_freq for i in range(
+			self.train_args.n_steps // decorr_update_freq + 1)]
 		
 		train_iterator = iter(train_loader)
 
@@ -409,38 +417,7 @@ class MambaTrainer:
 			if self.train_args.gradient_clip is not None:
 				scaler.unscale_(optimizer)
 				torch.nn.utils.clip_grad_norm_(self.model.parameters(), 
-											self.train_args.gradient_clip)
-			
-			# # calculating update ratio information for the backprop-trained
-			# # parameters
-			# if step%log_freq == 0 and train_backprop:
-				
-			# 	n_pars = 0
-				
-			# 	mean_update_ratio = 0.0
-			# 	min_update_ratio = float("inf")
-			# 	max_update_ratio = -float("inf")
-
-			# 	for _, param in self.model.named_parameters():
-			# 		if param.grad is not None and not \
-			# 			isinstance(param, DecorrLinear) and not \
-			# 				isinstance(param, DecorrConv1d):
-
-			# 			n_pars += 1
-			# 			weight_norm = torch.norm(param).item()		
-			# 			grad_norm = torch.norm(param.grad).item()
-			# 			update_ratio = grad_norm / weight_norm
-			# 			mean_update_ratio += update_ratio
-			# 			if update_ratio < min_update_ratio:
-			# 				min_update_ratio = update_ratio
-			# 			if update_ratio > max_update_ratio:
-			# 				max_update_ratio = update_ratio
-
-			# 	mean_update_ratio /= n_pars
-
-			# 	wandb.log({"update_ratio/mean": mean_update_ratio,
-			# 				"update_ratio/min": min_update_ratio,
-			# 				"update_ratio/max": max_update_ratio}, step=step)									
+											self.train_args.gradient_clip)									
 
 			if train_backprop:
 				scaler.step(optimizer)
@@ -451,10 +428,11 @@ class MambaTrainer:
 						decorr_scheduler.step(step)
 			
 			# update the decorrelation matrices AFTER standard backprop, 
-			# else training breaks!
-			if isinstance(self.get_model(), DecorrMamba):
+			# else training breaks! Second condition allows for sparse
+			# matrix updating
+			if isinstance(self.get_model(), DecorrMamba) and step in decorr_update_sched:
 				if self.get_model().compute_loss or self.model.training:
-					self.get_model().decorr_operations()
+					self.get_model().decorr_operations(crop_frac=crop_frac)
 					# average decorrelation gradients and losses across each
 					# copy of the layer before updating parameters
 
@@ -479,7 +457,8 @@ class MambaTrainer:
 							"train_whit_loss": train_whit_loss}, step=step)	
 					
 				if train_decorr:
-					self.get_model().update_decorr_matrices()
+					self.get_model().update_decorr_matrices(
+						self.train_args.decorr_lr, self.train_args.demeaning_lr)
 
 			# Condition checking if validate_every number of gradient descent
 			# steps have happened
@@ -630,7 +609,8 @@ class MambaTrainer:
 	def train_synthetic(self, train_dataset: TensorDataset, 
 		val_loaders: dict[DataLoader, str], test_loaders: dict[DataLoader, str],
 		use_amp: bool, log_freq: int, n_val: int, task: str, train_backprop: bool=True, 
-		train_decorr: bool=True, save_checkpoints: bool=True, skip_init_val: bool=False):
+		train_decorr: bool=True, save_checkpoints: bool=True, skip_init_val: bool=False,
+		crop_frac: float = 1.0):
 
 		''' 
 		Trains the model with the protocol specified in train_args. Trains based
@@ -706,7 +686,7 @@ class MambaTrainer:
 			# too!
 			if isinstance(self.get_model(), DecorrMamba):
 				decorr_scheduler = DecorrLRScheduler(
-					model=self.get_model(), lr_lambda=self.train_args.schedule_fn)
+					train_args=self.train_args)
 
 			# visualize learning rate schedule for the backprop parameters
 			# NOTE: DOES NOT WORK FOR THE DECORRELATION LR!! 
@@ -862,10 +842,10 @@ class MambaTrainer:
 						decorr_scheduler.step(step)
 			
 			# update the decorrelation matrices AFTER standard backprop, 
-			# else training breaks!
+			# else training breaks! 
 			if isinstance(self.get_model(), DecorrMamba):
 				if self.get_model().compute_loss or self.model.training:
-					self.get_model().decorr_operations()
+					self.get_model().decorr_operations(crop_frac=crop_frac)
 					self.get_model().mean_decorr_losses()
 
 				train_corr_loss = self.get_model().mean_corr_loss
@@ -881,7 +861,8 @@ class MambaTrainer:
 							"train_whit_loss": train_whit_loss}, step=step)	
 					
 				if train_decorr:
-					self.get_model().update_decorr_matrices()
+					self.get_model().update_decorr_matrices(
+						self.train_args.decorr_lr, self.train_args.demeaning_lr)
 
 			# Condition checking if validate_every number of gradient descent
 			# steps have happened
