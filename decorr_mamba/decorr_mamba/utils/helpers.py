@@ -52,7 +52,8 @@ class TrainingArgs():
 		assert self.n_steps is not None, "Must specify n_steps"
 		if self.use_lr_sched:
 			assert self.warmup_steps is not None, "Warmup epochs/steps specification missing"
-			assert self.warmup_steps <= self.n_steps, "Warmup epochs/steps > total epochs/steps"
+			# necessary otherwise sweep freaks out
+			# assert self.warmup_steps <= self.n_steps, "Warmup epochs/steps > total epochs/steps"
 
 			self.schedule_fn: Callable[[int], float] = self._lm_learning_schedule
 

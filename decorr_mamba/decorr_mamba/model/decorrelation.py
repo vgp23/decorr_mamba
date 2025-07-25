@@ -62,18 +62,18 @@ class DecorrLoss(nn.Module):
 			# matrix to train
 			if not batched:
 				# collapse input across the batch and length dimensions
-				_, _, d = x.shape
-				x = x.reshape(-1, d)
+				x = rearrange(x, 'b l d -> (b l) d')
 				mean_dim = 0
 			# used where decorrelation layer has multiple matrices to train
-			# (this is the case for "channel_independent")
+			# (this is the case for Conv1d)
 			else:
+				# for conv1d! 
 				# collapse across batch and n_patches dimension
-				_, _, d, decorr_matrix_size = x.shape
 				# in this case we're updating d matrices, each with info
 				# from one embedding dimension channel.
 				# (D, all_samples, decorr_matrix_size)
-				x = x.permute(2, 0, 1, 3).reshape(d, -1, decorr_matrix_size)
+				x = rearrange(x, 
+					'b n_patches d decorr_matrix_size -> d (b n_patches) decorr_matrix_size')
 				mean_dim=1
 
 			# computing losses
