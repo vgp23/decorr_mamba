@@ -7,6 +7,7 @@ from functools import partial
 from copy import deepcopy
 import torch.nn.functional as F
 from torch.nn.functional import linear, conv1d
+import gc 
 
 from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.modules.mamba2 import Mamba2
@@ -62,7 +63,7 @@ class DecorrLoss(nn.Module):
 			# matrix to train
 			if not batched:
 				# collapse input across the batch and length dimensions
-				x = rearrange(x, 'b l d -> (b l) d')
+				x = rearrange(x, 'b l d -> (b l) d').contiguous()
 				mean_dim = 0
 			# used where decorrelation layer has multiple matrices to train
 			# (this is the case for Conv1d)
@@ -73,7 +74,7 @@ class DecorrLoss(nn.Module):
 				# from one embedding dimension channel.
 				# (D, all_samples, decorr_matrix_size)
 				x = rearrange(x, 
-					'b n_patches d decorr_matrix_size -> d (b n_patches) decorr_matrix_size')
+					'b n_patches d decorr_matrix_size -> d (b n_patches) decorr_matrix_size').contiguous()
 				mean_dim=1
 
 			# computing losses
@@ -115,6 +116,13 @@ class DecorrLoss(nn.Module):
 			else:
 				corr_loss = whit_loss = None 
 
+			# gc.collect()
+
+			# # Release cached memory from the GPU allocator
+			# if torch.cuda.is_available():
+			# 	torch.cuda.empty_cache()
+			# 	torch.cuda.ipc_collect()
+
 			return grad, corr_loss, whit_loss
 			
 class DecorrMixin:
@@ -130,6 +138,7 @@ class DecorrMixin:
 		self.compute_loss = compute_loss
 		self.loss_module = DecorrLoss()
 		self.inputs = None
+		self.crop_frac = None
 		self.demeaning = demeaning 
 
 	def reset(self):
@@ -256,11 +265,10 @@ class DecorrLinear(DecorrMixin, nn.Linear):
 			if num_samples < 1:
 				num_samples = 1
 			
-			subset = x[torch.randperm(b, device=x.device)[:num_samples]]
+			subset = x[torch.randperm(b, device=x.device)[:num_samples]].contiguous()
 
 			# forward pass this through the decorrelation matrix
-			with torch.no_grad():
-				decorr_out = subset @ self.decorr_layer.T
+			decorr_out = subset @ self.decorr_layer.T
 
 			grad, corr_loss, whit_loss = self.loss_module(
 				decorr_out, self.kappa, self.training, self.compute_loss, batched=False)		
@@ -381,7 +389,7 @@ class DecorrConv1d(DecorrMixin, nn.Conv1d):
 				num_samples = 1
 
 			# select a subset of the logged inputs
-			subset = x[torch.randperm(b, device=x.device)[:num_samples]]
+			subset = x[torch.randperm(b, device=x.device)[:num_samples]].contiguous()
 
 			# get patches that the convolutional kernel would see
 			# all data in each convolution patch is represented in a single vector
@@ -389,7 +397,7 @@ class DecorrConv1d(DecorrMixin, nn.Conv1d):
 			x_unfolded = F.unfold(
 				subset.unsqueeze(1), 
 				(d_inner, self.kernel_size[0]), 
-				stride=1, padding=(0, self.kernel_size[0]-1))
+				stride=1, padding=(0, self.kernel_size[0]-1)).contiguous()
 			
 			# reshapes all inputs as corresponding convolutional "patches"
 			patch_matrices = x_unfolded.reshape(
@@ -1023,33 +1031,43 @@ class DecorrMamba(MambaLMHeadModel):
 		"""
 		self.apply_to_decorr(lambda x: x.fuse_decorr())
 
-	def decorr_operations(self, crop_frac: float = 1.0):
+	def decorr_operations(self):
 		""" 
 		Performs all decorrelation operations (loss and/or gradient computation, 
 		depending on configuration)."""
-		# crop_frac is used in case we want to sample even less than one 
-		# sequence. We shorten the sequence length to accomplish this!
+
+		# crop_frac is used in case we want to shorten sequences from 
+		# which we compute decorrelation updates. Each module has its own
+		# fraction, as SaShiMi operates on multiple temporal resolutions. 
+		lengths = []
 		def cropped_decorr_op(module):
 
-			if isinstance(module, DecorrLinear):
-				# inputs of shape (B,L,D)
-				_, L, _ = module.inputs.shape
-				cropped_len = int(crop_frac*L)
-				module.compute_decorr_grad_loss(
-					module.inputs[:, :cropped_len, :])
-			elif isinstance(module, DecorrConv1d):
-				# inputs of shape (B, D, L)
-				_, _, L = module.inputs.shape
-				cropped_len = int(crop_frac*L)
-				module.compute_decorr_grad_loss(
-					module.inputs[:, :, :cropped_len])	
+			if module.crop_frac:
+				if isinstance(module, DecorrLinear):
+					# inputs of shape (B,L,D)
+					_, L, _ = module.inputs.shape
+					cropped_len = max(int(module.crop_frac*L), 1)
+					lengths.append({L : cropped_len})
+					module.compute_decorr_grad_loss(
+						module.inputs[:, :cropped_len, :].contiguous())
+					
+				elif isinstance(module, DecorrConv1d):
+					# inputs of shape (B, D, L)
+					_, _, L = module.inputs.shape
+					cropped_len = max(int(module.crop_frac*L), 1)
+					lengths.append({L : cropped_len})
+					module.compute_decorr_grad_loss(
+						module.inputs[:, :, :cropped_len].contiguous())	
+				
+				else:
+					return NotImplementedError
+				
 			else:
-				cropped_len = None
-				return NotImplementedError
-			
-			assert cropped_len >= 1, "Cropping length too small!"
+				module.compute_decorr_grad_loss(module.inputs.contiguous())
 			
 		self.apply_to_decorr(cropped_decorr_op)
+
+		# print(lengths)
 
 	def update_decorr_matrices(self, decorr_lr: float, demeaning_lr: float = None):
 		""" 
@@ -1095,7 +1113,7 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 	def __init__(self, existing_model: SaShiMiMamba = None, copy: bool = False, 
 			  kappa: float = 0.5, sample_frac: float = 0.1,
 			  compute_loss: bool = True, to_remove: list[str] = [], 
-			  demeaning: bool = False, **factory_kwargs):
+			  demeaning: bool = False, crop_frac: float = None, **factory_kwargs):
 		
 		if existing_model and copy:
 			self.__dict__.update(deepcopy(existing_model).__dict__)
@@ -1119,6 +1137,12 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 		self.to_remove = to_remove
 		self.demeaning=demeaning
 
+		if self.config.ssm_cfg.get("layer") == "Mamba2":
+			decorr_linear_names = ["in_proj", "out_proj", "up_pool", "down_pool"]
+		else:
+			decorr_linear_names = ["in_proj", "out_proj", "x_proj", "up_pool", "down_pool"]
+		decorr_layer_names = decorr_linear_names + ["conv1d"]
+
 		def _create_decorr_matrices(module):
 			""" 
 			Used to recursively traverse model and create decorrelation matrices 
@@ -1127,10 +1151,6 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 			Args:
 				module (nn.Module): model layers to add decorrelation into 
 			"""
-			if self.config.ssm_cfg.get("layer") == "Mamba2":
-				decorr_linear_names = ["in_proj", "out_proj", "up_pool", "down_pool"]
-			else:
-				decorr_linear_names = ["in_proj", "out_proj", "x_proj", "up_pool", "down_pool"]
 
 			for name, child in module.named_children():
 				if name in decorr_linear_names and not name in self.to_remove:
@@ -1169,6 +1189,36 @@ class DecorrSaShiMiMamba(DecorrMamba, SaShiMiMamba):
 				# 	child.step = self._mamba2_block_step.__get__(child)				
 
 		self.apply(_modify_mamba_block_functions)
+
+		# set the crop fraction for each of the decorrelation layers.
+		# really janky, but there's no clean way to do this, since we want
+		# to scale the cropping fraction proportionally to the down-sampling 
+		# happening within the architecture.
+
+		if crop_frac:
+			# the down_pool decorrelation layers "see" the down-pooled version
+			# already (after the reshape), hence why we start at 1
+			for i, (dp, up) in enumerate(
+					zip(self.down_pooling, self.up_pooling), start=1):
+				
+				dp.down_pool.crop_frac = min(self.p**i*crop_frac, 1)
+				up.up_pool.crop_frac = min(self.p**i*crop_frac, 1)
+
+			# there's one more block in down stages than in up, loop separately
+			# for clarity. 
+			for i, blocks in enumerate(self.mamba_stages_down):
+				for block in blocks.layers:
+					for name, child in block.mixer.named_children():
+						if name in decorr_layer_names and not name in self.to_remove:
+							child.crop_frac = min(self.p**i*crop_frac, 1)
+			
+			for i, blocks in enumerate(self.mamba_stages_up):
+				for block in blocks.layers:
+					for name, child in block.mixer.named_children():
+						if name in decorr_layer_names and not name in self.to_remove:
+							child.crop_frac = min(self.p**i*crop_frac, 1)
+		
+
 
 	def forward(self, x):
 		# fuse decorrelation + main model parameters, then let forward

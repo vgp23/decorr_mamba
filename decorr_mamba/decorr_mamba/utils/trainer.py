@@ -179,8 +179,8 @@ class MambaTrainer:
 	def train_sequence_steps(self, train_loader, val_loader: DataLoader, test_loader:DataLoader,
 		use_amp: bool, log_freq: int, n_val: int, train_backprop: bool=True, 
 		train_decorr: bool=True, save_checkpoints: bool=True, pad_idx: int = None,
-		skip_init_val: bool=False, datashuffle_seed: int=0, metric="ppl", val_sched_base: int=20,
-		crop_frac: float = 1.0, decorr_update_freq: int = 1):
+		skip_init_val: bool=False, datashuffle_seed: int=0, metric="ppl", val_sched_base: int=20, 
+		decorr_update_freq: int = 1):
 
 		''' 
 		Trains the model with the protocol specified in train_args. Trains based
@@ -431,8 +431,11 @@ class MambaTrainer:
 			# else training breaks! Second condition allows for sparse
 			# matrix updating
 			if isinstance(self.get_model(), DecorrMamba) and step in decorr_update_sched:
+
 				if self.get_model().compute_loss or self.model.training:
-					self.get_model().decorr_operations(crop_frac=crop_frac)
+					with torch.no_grad():
+						self.get_model().decorr_operations()
+
 					# average decorrelation gradients and losses across each
 					# copy of the layer before updating parameters
 
@@ -609,8 +612,7 @@ class MambaTrainer:
 	def train_synthetic(self, train_dataset: TensorDataset, 
 		val_loaders: dict[DataLoader, str], test_loaders: dict[DataLoader, str],
 		use_amp: bool, log_freq: int, n_val: int, task: str, train_backprop: bool=True, 
-		train_decorr: bool=True, save_checkpoints: bool=True, skip_init_val: bool=False,
-		crop_frac: float = 1.0):
+		train_decorr: bool=True, save_checkpoints: bool=True, skip_init_val: bool=False):
 
 		''' 
 		Trains the model with the protocol specified in train_args. Trains based
@@ -767,7 +769,7 @@ class MambaTrainer:
 					print(f"Initial val accuracy {name}: {total_val_acc:.2f}%")				
 					print(f"Initial val CE loss {name}: {total_val_ce_loss:.4f}")
 					wandb.log({
-						"val_ce_loss_{name}": total_val_ce_loss,
+						f"val_ce_loss_{name}": total_val_ce_loss,
 						f"val_acc_{name}": total_val_acc}, step=step)
 						
 				self.model.train()	
@@ -845,7 +847,7 @@ class MambaTrainer:
 			# else training breaks! 
 			if isinstance(self.get_model(), DecorrMamba):
 				if self.get_model().compute_loss or self.model.training:
-					self.get_model().decorr_operations(crop_frac=crop_frac)
+					self.get_model().decorr_operations()
 					self.get_model().mean_decorr_losses()
 
 				train_corr_loss = self.get_model().mean_corr_loss

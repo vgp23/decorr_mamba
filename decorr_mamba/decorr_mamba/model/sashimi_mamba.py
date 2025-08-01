@@ -210,6 +210,9 @@ class SaShiMiMamba(nn.Module):
 		pad_vocab_size_multiple = config.pad_vocab_size_multiple
 		factory_kwargs = {"device": device, "dtype": dtype}	
 
+		self.p = p
+		self.q = q
+
 		if vocab_size % pad_vocab_size_multiple != 0:
 			vocab_size += pad_vocab_size_multiple - (vocab_size % pad_vocab_size_multiple)	
 

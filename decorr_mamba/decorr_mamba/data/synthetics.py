@@ -99,7 +99,7 @@ class InductionData:
         batch = torch.randint(0, self.vocab_size-1, (self.B, self.L+1))
         # index where the "cue" token will be placed. This position is the
         # same across an entire batch, but varies across batches. 
-        inds = torch.randint(0, self.prefix_len, (1,))*torch.ones((self.B, 1)).to(torch.int64)
+        inds = torch.randint(0, self.prefix_len, (self.B, 1))
         # indices where the "retrieval" token will be placed
         inds2 = torch.full((self.B,1), self.L)
 
