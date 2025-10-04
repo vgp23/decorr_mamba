@@ -52,76 +52,62 @@ class DecorrLoss(nn.Module):
 		super(DecorrLoss, self).__init__()
 
 	def forward(self, x, kappa: float, compute_grad: bool, 
-		compute_loss: bool, batched: bool):
+						compute_loss: bool, batched: bool):
+		
+		print("new implementation!")
 
 		with torch.no_grad():
 
+
 			assert kappa is not None, "Specify kappa for loss and gradient computation"
-			assert kappa <= 1.0 and kappa >= 0.0, "kappa must be between 0 and 1"
+			assert 0.0 <= kappa <= 1.0, "kappa must be between 0 and 1"
 
-			# used for all modes where the decorrelation layer has only a single
-			# matrix to train
+			# Determine batch and mean dimensions
 			if not batched:
-				# collapse input across the batch and length dimensions
-				x = rearrange(x, 'b l d -> (b l) d').contiguous()
+				# Collapse across batch and sequence/length dimension
+				x = rearrange(x, 'b l d -> (b l) d').contiguous()  # (B, D)
 				mean_dim = 0
-			# used where decorrelation layer has multiple matrices to train
-			# (this is the case for Conv1d)
 			else:
-				# for conv1d! 
-				# collapse across batch and n_patches dimension
-				# in this case we're updating d matrices, each with info
-				# from one embedding dimension channel.
-				# (D, all_samples, decorr_matrix_size)
-				x = rearrange(x, 
-					'b n_patches d decorr_matrix_size -> d (b n_patches) decorr_matrix_size').contiguous()
-				mean_dim=1
+				# Collapse across batch and n_patches for multiple decorrelation matrices
+				# Resulting shape: (D, B, decorr_matrix_size)
+				x = rearrange(x, 'b n_patches d decorr_matrix_size -> d (b n_patches) decorr_matrix_size').contiguous()
+				mean_dim = 1
 
-			# computing losses
-			if kappa == 0:
-				# compute covariance components only
-				C = x.unsqueeze(-1) * x.unsqueeze(-2)
-				C.diagonal(dim1=-2, dim2=-1).zero_()
-			elif kappa == 1:
-				# compute variance components only
-				V = x * x - 1
-			else:
-				# compute both
-				C = x.unsqueeze(-1) * x.unsqueeze(-2)
-				V = C.diagonal(dim1=-2, dim2=-1) - 1
-				C.diagonal(dim1=-2, dim2=-1).zero_()
+			n_samples = x.shape[mean_dim]
+			R = x.shape[-1] # decorrelation matrix size
 
-			# compute the actual gradient, if applicable
+			grad = None
+			corr_loss = None
+			whit_loss = None
+
+			# C_sum has shape (..., R, R)
+			C_sum = torch.matmul(x.transpose(-2, -1), x) 
+			C_mean = C_sum / n_samples # this term is equivalent to the expectation
+
+			# zero the diagonal in-place on the mean covariance (off-diagonals unaffected)
+			C_mean.diagonal(dim1=-2, dim2=-1).zero_()
+
+			# variance mean: mean over batch of (x^2 - 1), shape (..., R)
+			V_mean = (x * x - 1).mean(dim=-2)
+
 			if compute_grad:
-				if kappa == 0:
-					grad = torch.mean(C, dim=mean_dim)
-				elif kappa == 1:
-					# TODO: implement a nicer way of dealing with this to
-					# avoid unnecessary operations in the gradient update
-					grad = torch.diag_embed(torch.mean(V, dim=mean_dim))
+				if kappa == 0.0:
+					# covariance only: use off-diagonals of C_mean
+					grad = C_mean
+				elif kappa == 1.0:
+					# variance only
+					grad = torch.diag_embed(V_mean)
 				else:
-					# implemented this way to remove unnecessary addition
-					# of zeros
-					unaveraged = (1-kappa) * C
-					unaveraged.diagonal(dim1=-2, dim2=-1).add_(kappa*V)
-					grad = torch.mean(unaveraged, dim=mean_dim)
-			else:
-				grad = None
-		
+					# both: (1-kappa)*offdiag + diag(kappa * mean(V_i))
+					grad = (1.0 - kappa) * C_mean
+					idx = torch.arange(R, device=x.device)
+					grad[..., idx, idx] += kappa * V_mean
+
 			if compute_loss:
-				# mean of squared covariances
-				corr_loss = (C*C).mean() if kappa < 1 else None
-				# mean of squared variances
-				whit_loss = (V*V).mean() if kappa > 0 else None
-			else:
-				corr_loss = whit_loss = None 
-
-			# gc.collect()
-
-			# # Release cached memory from the GPU allocator
-			# if torch.cuda.is_available():
-			# 	torch.cuda.empty_cache()
-			# 	torch.cuda.ipc_collect()
+				if kappa < 1:
+					corr_loss = (C_mean * C_mean).mean()
+				if kappa > 0:
+					whit_loss = (V_mean * V_mean).mean()
 
 			return grad, corr_loss, whit_loss
 			
